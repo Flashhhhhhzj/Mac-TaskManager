@@ -13,6 +13,7 @@ enum ProcessStatus {
 struct AppProcess: Identifiable {
     var id: Int32 { pid }
     let pid: Int32
+    let parentPID: Int32
     let name: String
     let cpuUsage: Double
     let memoryUsage: UInt64
@@ -45,6 +46,7 @@ class SystemMonitor: ObservableObject {
     @Published var totalMemory: UInt64 = 0
     @Published var usedMemory: UInt64 = 0
     @Published var ports: [PortEntry] = []
+    private(set) var processVersion = 0
 
     private var timer: Timer?
     private let refreshQueue = DispatchQueue(label: "MacSystemMonitor.refresh", qos: .background)
@@ -57,6 +59,8 @@ class SystemMonitor: ObservableObject {
     private var isNetworkSampling = false
     private var previousProcessSampleTime: Date?
     private var previousNetworkSampleTime: Date?
+    private var appIconCache: [Int32: NSImage] = [:]
+    private let fallbackProcessIcon = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
 
     init() {
         startMonitoring()
@@ -88,7 +92,7 @@ class SystemMonitor: ObservableObject {
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-axo", "pid=,pcpu=,rss=,user=,command="]
+        task.arguments = ["-axo", "pid=,ppid=,pcpu=,rss=,user=,command="]
 
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -114,6 +118,7 @@ class SystemMonitor: ObservableObject {
         }
 
         let appMap = Dictionary(uniqueKeysWithValues: runningApps.map { ($0.processIdentifier, $0) })
+        var currentProcessIDs = Set<Int32>()
 
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -121,22 +126,25 @@ class SystemMonitor: ObservableObject {
 
             let components = trimmed.split(
                 separator: " ",
-                maxSplits: 4,
+                maxSplits: 5,
                 omittingEmptySubsequences: true
             )
-            guard components.count >= 5 else { continue }
+            guard components.count >= 6 else { continue }
 
             guard let pid = Int32(components[0]),
-                  let cpu = Double(components[1]),
-                  let rss = UInt64(components[2]) else { continue }
+                  let parentPID = Int32(components[1]),
+                  let cpu = Double(components[2]),
+                  let rss = UInt64(components[3]) else { continue }
 
-            let user = String(components[3])
+            currentProcessIDs.insert(pid)
+            let user = String(components[4])
             let normalizedCPU = min(cpu / Double(processorCount), 100)
-            let command = String(components[4])
+            let command = String(components[5])
             let matchedApp = appMap[pid]
-            let isApp = matchedApp?.activationPolicy == .regular
+            let appIcon = icon(for: pid, app: matchedApp)
+            let isApp = appIcon != nil && isApplicationProcess(command: command, app: matchedApp)
             let name = displayName(pid: pid, command: command, app: matchedApp, isApp: isApp)
-            let icon: NSImage? = matchedApp?.icon ?? NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
+            let icon: NSImage? = appIcon ?? fallbackProcessIcon
             let diskTotal = diskBytes(for: pid)
             let diskBytesPerSecond: Double
             if let elapsed, let previousTotal = previousDiskTotals[pid], diskTotal >= previousTotal {
@@ -151,6 +159,7 @@ class SystemMonitor: ObservableObject {
 
             processes.append(AppProcess(
                 pid: pid,
+                parentPID: parentPID,
                 name: name,
                 cpuUsage: normalizedCPU,
                 memoryUsage: rss * 1024,
@@ -165,10 +174,41 @@ class SystemMonitor: ObservableObject {
 
         previousDiskTotals = currentDiskTotals
         previousProcessSampleTime = sampleTime
+        appIconCache = appIconCache.filter { currentProcessIDs.contains($0.key) }
 
+        let sortedProcesses = sortProcessesByMemory(processes)
         DispatchQueue.main.async {
-            self.processes = self.sortProcessesByMemory(processes)
+            self.processVersion &+= 1
+            self.processes = sortedProcesses
         }
+    }
+
+    private func icon(for pid: Int32, app: NSRunningApplication?) -> NSImage? {
+        if let cachedIcon = appIconCache[pid] {
+            return cachedIcon
+        }
+        guard let icon = app?.icon else { return nil }
+        appIconCache[pid] = icon
+        return icon
+    }
+
+    private func isApplicationProcess(command: String, app: NSRunningApplication?) -> Bool {
+        if app?.activationPolicy == .regular {
+            return true
+        }
+        if let bundlePath = app?.bundleURL?.path, isApplicationsBundlePath(bundlePath) {
+            return true
+        }
+        return isApplicationsBundlePath(command)
+    }
+
+    private func isApplicationsBundlePath(_ path: String) -> Bool {
+        let normalizedPath = (path.replacingOccurrences(of: "\\ ", with: " ") as NSString).standardizingPath
+        let components = normalizedPath.split(separator: "/").map(String.init)
+        guard let appComponentIndex = components.firstIndex(where: { $0.hasSuffix(".app") }) else {
+            return false
+        }
+        return components[..<appComponentIndex].contains("Applications")
     }
 
     private func sortProcessesByMemory(_ processes: [AppProcess]) -> [AppProcess] {
@@ -483,11 +523,41 @@ final class ContentViewState: ObservableObject {
     @Published var runTaskError = ""
     @Published var efficiencyPIDs: Set<Int32> = []
     @Published var frozenProcessOrder: [Int32]?
+    @Published var expandedProcessIDs: Set<Int32> = []
+
+    private var processTableCacheKey: ProcessTableCacheKey?
+    private var processTableCache: ProcessTableData?
+
+    func processTableData(processes: [AppProcess], processVersion: Int) -> ProcessTableData {
+        let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = ProcessTableCacheKey(
+            processVersion: processVersion,
+            searchText: normalizedSearch,
+            frozenProcessOrder: frozenProcessOrder,
+            expandedProcessIDs: expandedProcessIDs.sorted()
+        )
+
+        if processTableCacheKey == key, let processTableCache {
+            return processTableCache
+        }
+
+        let tableData = ProcessTableData.make(
+            processes: processes,
+            searchText: normalizedSearch,
+            frozenProcessOrder: frozenProcessOrder,
+            expandedProcessIDs: expandedProcessIDs
+        )
+        processTableCacheKey = key
+        processTableCache = tableData
+        return tableData
+    }
 }
 
 enum TaskManagerStyle {
     static let contentWidth: CGFloat = 1023
     static let contentHeight: CGFloat = 726
+    static let minContentWidth: CGFloat = 860
+    static let minContentHeight: CGFloat = 520
     static let shadowMargin: CGFloat = 16
     static let cornerRadius: CGFloat = 8
     static let chrome = Color(red: 0.937, green: 0.949, blue: 0.973)
@@ -506,6 +576,151 @@ enum TaskManagerStyle {
 struct ResourceSample {
     let diskBytesPerSecond: Double
     let networkBytesPerSecond: Double
+}
+
+struct ProcessTreeRow: Identifiable {
+    var id: Int32 { process.pid }
+    let process: AppProcess
+    let level: Int
+    let hasChildren: Bool
+    let childCount: Int
+    let isExpanded: Bool
+}
+
+struct ProcessTableData {
+    let filteredProcesses: [AppProcess]
+    let appRootProcesses: [AppProcess]
+    let backgroundRootProcesses: [AppProcess]
+    let appProcessRows: [ProcessTreeRow]
+    let backgroundProcessRows: [ProcessTreeRow]
+
+    static func make(
+        processes: [AppProcess],
+        searchText: String,
+        frozenProcessOrder: [Int32]?,
+        expandedProcessIDs: Set<Int32>
+    ) -> ProcessTableData {
+        let matchingProcesses = processes.filter { process in
+            searchText.isEmpty ||
+                process.name.localizedCaseInsensitiveContains(searchText) ||
+                process.user.localizedCaseInsensitiveContains(searchText) ||
+                String(process.pid).contains(searchText)
+        }
+        let normallySorted = normallySortedProcesses(matchingProcesses)
+        let filteredProcesses = frozenSortedProcesses(normallySorted, frozenProcessOrder: frozenProcessOrder)
+        let visiblePIDs = Set(filteredProcesses.map(\.pid))
+        let childrenByParent = Dictionary(
+            grouping: filteredProcesses.filter { $0.parentPID > 1 && visiblePIDs.contains($0.parentPID) },
+            by: \.parentPID
+        )
+        let rootProcesses = filteredProcesses.filter { $0.parentPID <= 1 || !visiblePIDs.contains($0.parentPID) }
+        let appRootProcesses = rootProcesses.filter { $0.isApp }
+        let backgroundRootProcesses = rootProcesses.filter { !$0.isApp }
+
+        return ProcessTableData(
+            filteredProcesses: filteredProcesses,
+            appRootProcesses: appRootProcesses,
+            backgroundRootProcesses: backgroundRootProcesses,
+            appProcessRows: visibleRows(
+                for: appRootProcesses,
+                childrenByParent: childrenByParent,
+                expandedProcessIDs: expandedProcessIDs
+            ),
+            backgroundProcessRows: visibleRows(
+                for: backgroundRootProcesses,
+                childrenByParent: childrenByParent,
+                expandedProcessIDs: expandedProcessIDs
+            )
+        )
+    }
+
+    private static func normallySortedProcesses(_ processes: [AppProcess]) -> [AppProcess] {
+        processes.sorted {
+            if $0.isApp != $1.isApp { return $0.isApp && !$1.isApp }
+            if $0.memoryUsage != $1.memoryUsage { return $0.memoryUsage > $1.memoryUsage }
+            if $0.cpuUsage != $1.cpuUsage { return $0.cpuUsage > $1.cpuUsage }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private static func frozenSortedProcesses(
+        _ normallySorted: [AppProcess],
+        frozenProcessOrder: [Int32]?
+    ) -> [AppProcess] {
+        guard let frozenProcessOrder else { return normallySorted }
+
+        let frozenRank = Dictionary(uniqueKeysWithValues: frozenProcessOrder.enumerated().map { ($0.element, $0.offset) })
+        let normalRank = Dictionary(uniqueKeysWithValues: normallySorted.enumerated().map { ($0.element.pid, $0.offset) })
+        return normallySorted.sorted {
+            let leftFrozenRank = frozenRank[$0.pid] ?? Int.max
+            let rightFrozenRank = frozenRank[$1.pid] ?? Int.max
+            if leftFrozenRank != rightFrozenRank {
+                return leftFrozenRank < rightFrozenRank
+            }
+            return (normalRank[$0.pid] ?? Int.max) < (normalRank[$1.pid] ?? Int.max)
+        }
+    }
+
+    private static func visibleRows(
+        for roots: [AppProcess],
+        childrenByParent: [Int32: [AppProcess]],
+        expandedProcessIDs: Set<Int32>
+    ) -> [ProcessTreeRow] {
+        var rows: [ProcessTreeRow] = []
+        var visitedPIDs = Set<Int32>()
+        for process in roots {
+            appendVisibleRows(
+                for: process,
+                level: 0,
+                childrenByParent: childrenByParent,
+                expandedProcessIDs: expandedProcessIDs,
+                visitedPIDs: &visitedPIDs,
+                rows: &rows
+            )
+        }
+        return rows
+    }
+
+    private static func appendVisibleRows(
+        for process: AppProcess,
+        level: Int,
+        childrenByParent: [Int32: [AppProcess]],
+        expandedProcessIDs: Set<Int32>,
+        visitedPIDs: inout Set<Int32>,
+        rows: inout [ProcessTreeRow]
+    ) {
+        guard !visitedPIDs.contains(process.pid) else { return }
+        visitedPIDs.insert(process.pid)
+
+        let children = childrenByParent[process.pid] ?? []
+        let isExpanded = expandedProcessIDs.contains(process.pid)
+        rows.append(ProcessTreeRow(
+            process: process,
+            level: level,
+            hasChildren: !children.isEmpty,
+            childCount: children.count,
+            isExpanded: isExpanded
+        ))
+
+        guard isExpanded else { return }
+        for child in children {
+            appendVisibleRows(
+                for: child,
+                level: level + 1,
+                childrenByParent: childrenByParent,
+                expandedProcessIDs: expandedProcessIDs,
+                visitedPIDs: &visitedPIDs,
+                rows: &rows
+            )
+        }
+    }
+}
+
+struct ProcessTableCacheKey: Equatable {
+    let processVersion: Int
+    let searchText: String
+    let frozenProcessOrder: [Int32]?
+    let expandedProcessIDs: [Int32]
 }
 
 // MARK: - Views
@@ -533,7 +748,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
             }
-            .frame(width: TaskManagerStyle.contentWidth, height: TaskManagerStyle.contentHeight)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background {
                 RoundedRectangle(cornerRadius: TaskManagerStyle.cornerRadius, style: .continuous)
                     .fill(Color.white)
@@ -544,10 +759,13 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: TaskManagerStyle.cornerRadius, style: .continuous)
                     .stroke(Color(red: 0.333, green: 0.408, blue: 0.545), lineWidth: 1)
             }
+            .padding(TaskManagerStyle.shadowMargin)
         }
         .frame(
-            width: TaskManagerStyle.contentWidth + TaskManagerStyle.shadowMargin * 2,
-            height: TaskManagerStyle.contentHeight + TaskManagerStyle.shadowMargin * 2
+            minWidth: TaskManagerStyle.minContentWidth + TaskManagerStyle.shadowMargin * 2,
+            maxWidth: .infinity,
+            minHeight: TaskManagerStyle.minContentHeight + TaskManagerStyle.shadowMargin * 2,
+            maxHeight: .infinity
         )
         .background(Color.clear)
         .sheet(isPresented: $state.showRunTaskDialog) {
@@ -1196,49 +1414,6 @@ struct TaskManagerProcessTable: View {
     let statusWidth: CGFloat = 150
     let metricWidth: CGFloat = 91
 
-    var matchingProcesses: [AppProcess] {
-        let search = state.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return monitor.processes.filter { process in
-            search.isEmpty ||
-                process.name.localizedCaseInsensitiveContains(search) ||
-                process.user.localizedCaseInsensitiveContains(search) ||
-                String(process.pid).contains(search)
-        }
-    }
-
-    var filteredProcesses: [AppProcess] {
-        let normallySorted = normallySortedProcesses(matchingProcesses)
-        guard let frozenProcessOrder = state.frozenProcessOrder else { return normallySorted }
-
-        let frozenRank = Dictionary(uniqueKeysWithValues: frozenProcessOrder.enumerated().map { ($0.element, $0.offset) })
-        let normalRank = Dictionary(uniqueKeysWithValues: normallySorted.enumerated().map { ($0.element.pid, $0.offset) })
-        return normallySorted.sorted {
-            let leftFrozenRank = frozenRank[$0.pid] ?? Int.max
-            let rightFrozenRank = frozenRank[$1.pid] ?? Int.max
-            if leftFrozenRank != rightFrozenRank {
-                return leftFrozenRank < rightFrozenRank
-            }
-            return (normalRank[$0.pid] ?? Int.max) < (normalRank[$1.pid] ?? Int.max)
-        }
-    }
-
-    func normallySortedProcesses(_ processes: [AppProcess]) -> [AppProcess] {
-        processes.sorted {
-            if $0.isApp != $1.isApp { return $0.isApp && !$1.isApp }
-            if $0.memoryUsage != $1.memoryUsage { return $0.memoryUsage > $1.memoryUsage }
-            if $0.cpuUsage != $1.cpuUsage { return $0.cpuUsage > $1.cpuUsage }
-            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
-    }
-
-    var appProcesses: [AppProcess] {
-        filteredProcesses.filter { $0.isApp }
-    }
-
-    var backgroundProcesses: [AppProcess] {
-        filteredProcesses.filter { !$0.isApp }
-    }
-
     var memoryPercent: Double {
         guard monitor.totalMemory > 0 else { return 0 }
         return Double(monitor.usedMemory) / Double(monitor.totalMemory) * 100
@@ -1255,6 +1430,11 @@ struct TaskManagerProcessTable: View {
     }
 
     var body: some View {
+        let tableData = state.processTableData(
+            processes: monitor.processes,
+            processVersion: monitor.processVersion
+        )
+
         VStack(alignment: .leading, spacing: 0) {
             TableHeader(
                 nameWidth: nameWidth,
@@ -1266,60 +1446,75 @@ struct TaskManagerProcessTable: View {
                 network: networkPercent
             )
 
-            ScrollView {
+            ScrollView(.vertical, showsIndicators: true) {
                 LazyVStack(spacing: 0) {
-                    ProcessGroupHeader(title: "应用", count: appProcesses.count, nameWidth: nameWidth, statusWidth: statusWidth, metricWidth: metricWidth)
+                    ProcessGroupHeader(title: "应用", count: tableData.appRootProcesses.count, nameWidth: nameWidth, statusWidth: statusWidth, metricWidth: metricWidth)
 
-                    ForEach(appProcesses) { process in
+                    ForEach(tableData.appProcessRows) { row in
                         ProcessTableRow(
-                            process: process,
-                            selected: state.selectedPID == process.pid,
+                            process: row.process,
+                            level: row.level,
+                            hasChildren: row.hasChildren,
+                            childCount: row.childCount,
+                            isExpanded: row.isExpanded,
+                            selected: state.selectedPID == row.process.pid,
                             nameWidth: nameWidth,
                             statusWidth: statusWidth,
                             metricWidth: metricWidth,
-                            sample: resourceSample(for: process),
-                            efficiencyEnabled: state.efficiencyPIDs.contains(process.pid)
+                            sample: resourceSample(for: row.process),
+                            efficiencyEnabled: state.efficiencyPIDs.contains(row.process.pid),
+                            onToggleExpanded: {
+                                toggleExpanded(row.process.pid)
+                            }
                         )
                         .onTapGesture {
-                            state.selectedPID = process.pid
+                            state.selectedPID = row.process.pid
                         }
                         .onHover { hovering in
-                            if hovering {
-                                state.selectedPID = process.pid
+                            if hovering, state.selectedPID != row.process.pid {
+                                state.selectedPID = row.process.pid
                             }
                         }
                     }
 
-                    ProcessGroupHeader(title: "后台进程", count: backgroundProcesses.count, nameWidth: nameWidth, statusWidth: statusWidth, metricWidth: metricWidth)
+                    ProcessGroupHeader(title: "后台进程", count: tableData.backgroundRootProcesses.count, nameWidth: nameWidth, statusWidth: statusWidth, metricWidth: metricWidth)
 
-                    ForEach(backgroundProcesses) { process in
+                    ForEach(tableData.backgroundProcessRows) { row in
                         ProcessTableRow(
-                            process: process,
-                            selected: state.selectedPID == process.pid,
+                            process: row.process,
+                            level: row.level,
+                            hasChildren: row.hasChildren,
+                            childCount: row.childCount,
+                            isExpanded: row.isExpanded,
+                            selected: state.selectedPID == row.process.pid,
                             nameWidth: nameWidth,
                             statusWidth: statusWidth,
                             metricWidth: metricWidth,
-                            sample: resourceSample(for: process),
-                            efficiencyEnabled: state.efficiencyPIDs.contains(process.pid)
+                            sample: resourceSample(for: row.process),
+                            efficiencyEnabled: state.efficiencyPIDs.contains(row.process.pid),
+                            onToggleExpanded: {
+                                toggleExpanded(row.process.pid)
+                            }
                         )
                         .onTapGesture {
-                            state.selectedPID = process.pid
+                            state.selectedPID = row.process.pid
                         }
                         .onHover { hovering in
-                            if hovering {
-                                state.selectedPID = process.pid
+                            if hovering, state.selectedPID != row.process.pid {
+                                state.selectedPID = row.process.pid
                             }
                         }
                     }
                 }
                 .padding(.bottom, 20)
                 .frame(width: nameWidth + statusWidth + metricWidth * 4, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .onHover { hovering in
                 if hovering {
                     if state.frozenProcessOrder == nil {
-                        state.frozenProcessOrder = filteredProcesses.map(\.pid)
+                        state.frozenProcessOrder = tableData.filteredProcesses.map(\.pid)
                     }
                 } else {
                     state.frozenProcessOrder = nil
@@ -1327,11 +1522,6 @@ struct TaskManagerProcessTable: View {
             }
         }
         .background(Color.white)
-        .overlay(alignment: .trailing) {
-            TaskManagerScrollBar()
-                .padding(.top, 85)
-                .padding(.trailing, 9)
-        }
         .overlay(alignment: .top) {
             Rectangle()
                 .fill(TaskManagerStyle.grid)
@@ -1345,6 +1535,14 @@ struct TaskManagerProcessTable: View {
             diskBytesPerSecond: process.diskBytesPerSecond,
             networkBytesPerSecond: process.networkBytesPerSecond
         )
+    }
+
+    func toggleExpanded(_ pid: Int32) {
+        if state.expandedProcessIDs.contains(pid) {
+            state.expandedProcessIDs.remove(pid)
+        } else {
+            state.expandedProcessIDs.insert(pid)
+        }
     }
 }
 
@@ -1462,20 +1660,36 @@ struct ProcessGroupHeader: View {
 
 struct ProcessTableRow: View {
     let process: AppProcess
+    let level: Int
+    let hasChildren: Bool
+    let childCount: Int
+    let isExpanded: Bool
     let selected: Bool
     let nameWidth: CGFloat
     let statusWidth: CGFloat
     let metricWidth: CGFloat
     let sample: ResourceSample
     let efficiencyEnabled: Bool
+    let onToggleExpanded: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.gray)
-                    .frame(width: 16)
+                if hasChildren {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.gray)
+                        .frame(width: 16, height: 24)
+                        .contentShape(Rectangle())
+                        .highPriorityGesture(
+                            TapGesture().onEnded {
+                                onToggleExpanded()
+                            }
+                        )
+                } else {
+                    Color.clear
+                        .frame(width: 16, height: 24)
+                }
 
                 if let icon = process.icon {
                     Image(nsImage: icon)
@@ -1488,13 +1702,13 @@ struct ProcessTableRow: View {
                         .frame(width: 18, height: 18)
                 }
 
-                Text(displayName(for: process))
+                Text(rowTitle)
                     .font(.system(size: 15))
                     .foregroundColor(.black)
                     .lineLimit(1)
             }
             .offset(y: 2)
-            .padding(.leading, 22)
+            .padding(.leading, 22 + CGFloat(level) * 22)
             .frame(width: nameWidth, height: 34, alignment: .leading)
             .background(selected ? TaskManagerStyle.selectedRow : Color.white)
             .overlay(alignment: .trailing) {
@@ -1527,6 +1741,11 @@ struct ProcessTableRow: View {
             ResourceCell(text: formatNetwork(sample.networkBytesPerSecond), width: metricWidth, intensity: networkIntensity(sample.networkBytesPerSecond))
         }
         .contentShape(Rectangle())
+    }
+
+    var rowTitle: String {
+        let name = displayName(for: process)
+        return hasChildren ? "\(name) (\(childCount))" : name
     }
 
     func displayName(for process: AppProcess) -> String {
@@ -1615,18 +1834,6 @@ struct VerticalRule: View {
     }
 }
 
-struct TaskManagerScrollBar: View {
-    var body: some View {
-        VStack {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(Color(red: 0.522, green: 0.522, blue: 0.522))
-                .frame(width: 3, height: 30)
-            Spacer()
-        }
-        .frame(width: 5)
-    }
-}
-
 // MARK: - App
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1653,6 +1860,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.standardWindowButton(.closeButton)?.isHidden = true
             window.standardWindowButton(.miniaturizeButton)?.isHidden = true
             window.standardWindowButton(.zoomButton)?.isHidden = true
+            window.minSize = NSSize(
+                width: TaskManagerStyle.minContentWidth + TaskManagerStyle.shadowMargin * 2,
+                height: TaskManagerStyle.minContentHeight + TaskManagerStyle.shadowMargin * 2
+            )
             window.setContentSize(NSSize(
                 width: TaskManagerStyle.contentWidth + TaskManagerStyle.shadowMargin * 2,
                 height: TaskManagerStyle.contentHeight + TaskManagerStyle.shadowMargin * 2
