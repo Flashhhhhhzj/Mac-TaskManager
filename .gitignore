@@ -9,4 +9,10 @@ DerivedData/
 
 /MacSystemMonitor
 /MacSystemMonitor.app/
+/MacTaskManager
+/MacTaskManager.app/
+/Mac-TaskManager
+/Mac-TaskManager.app/
 /Resources/
+/assets/generated/
+/dist/

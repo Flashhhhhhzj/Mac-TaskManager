@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Foundation
 import Darwin
+import MacSMC
 
 // MARK: - Models
 enum ProcessStatus {
@@ -106,8 +107,8 @@ class SystemMonitor: ObservableObject {
     private(set) var processVersion = 0
 
     private var timer: Timer?
-    private let refreshQueue = DispatchQueue(label: "MacSystemMonitor.refresh", qos: .background)
-    private let networkQueue = DispatchQueue(label: "MacSystemMonitor.network", qos: .utility)
+    private let refreshQueue = DispatchQueue(label: "Mac-TaskManager.refresh", qos: .background)
+    private let networkQueue = DispatchQueue(label: "Mac-TaskManager.network", qos: .utility)
     private let networkLock = NSLock()
     private var previousCoreInfo: [(user: UInt32, system: UInt32, idle: UInt32, nice: UInt32)] = []
     private var previousDiskTotals: [Int32: (read: UInt64, write: UInt64)] = [:]
@@ -1066,9 +1067,8 @@ class SystemMonitor: ObservableObject {
         }
     }
 
-    func killProcess(pid: Int32, name: String? = nil) {
-        _ = name
-        guard kill(pid, SIGTERM) == 0 else { return }
+    func killProcess(pid: Int32, mode: ProcessTerminationMode) {
+        guard kill(pid, mode.signal) == 0 else { return }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.updateData()
@@ -1103,6 +1103,39 @@ class SystemMonitor: ObservableObject {
     }
 }
 
+enum ProcessTerminationMode: String, CaseIterable {
+    case quit = "退出"
+    case forceQuit = "强制退出"
+
+    private static let preferenceKey = "ProcessTerminationMode"
+
+    static var current: ProcessTerminationMode {
+        guard let storedValue = UserDefaults.standard.string(forKey: preferenceKey),
+              let mode = ProcessTerminationMode(rawValue: storedValue) else {
+            return .quit
+        }
+        return mode
+    }
+
+    var signal: Int32 {
+        switch self {
+        case .quit:
+            return SIGTERM
+        case .forceQuit:
+            return SIGKILL
+        }
+    }
+
+    var confirmationDescription: String {
+        switch self {
+        case .quit:
+            return "会请求该进程正常退出，未保存的数据仍可能丢失。"
+        case .forceQuit:
+            return "将立即终止该进程，未保存的数据将丢失，且应用无法执行清理操作。"
+        }
+    }
+}
+
 final class ContentViewState: ObservableObject {
     @Published var selectedNav = 0
     @Published var sidebarExpanded = false
@@ -1115,9 +1148,34 @@ final class ContentViewState: ObservableObject {
     @Published var frozenProcessOrder: [Int32]?
     @Published var expandedProcessIDs: Set<Int32> = []
     @Published var selectedPerformanceIndex = 0
+    @Published var appTheme = "使用系统设置"
+    @Published var defaultStartPage = "进程"
+    @Published var updateSpeed = "常规"
+    @Published var coolModePolicy = CoolModePreferences.currentPolicy.rawValue {
+        didSet {
+            UserDefaults.standard.set(selectedCoolModePolicy.rawValue, forKey: CoolModePreferences.policyKey)
+        }
+    }
+    @Published var processTerminationMode = ProcessTerminationMode.current.rawValue {
+        didSet {
+            UserDefaults.standard.set(terminationMode.rawValue, forKey: "ProcessTerminationMode")
+        }
+    }
+    @Published var windowManagementExpanded = true
+    @Published var alwaysOnTop = false
+    @Published var minimizeOnUse = true
+    @Published var hideWhenMinimized = false
 
     private var processTableCacheKey: ProcessTableCacheKey?
     private var processTableCache: ProcessTableData?
+
+    var terminationMode: ProcessTerminationMode {
+        ProcessTerminationMode(rawValue: processTerminationMode) ?? .quit
+    }
+
+    var selectedCoolModePolicy: CoolModePolicy {
+        CoolModePolicy(rawValue: coolModePolicy) ?? .comfort
+    }
 
     func processTableData(processes: [AppProcess], processVersion: Int) -> ProcessTableData {
         let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1144,10 +1202,15 @@ final class ContentViewState: ObservableObject {
     }
 }
 
+enum NavigationIndex {
+    static let settings = -1
+    static let fanControl = 2
+}
+
 enum TaskManagerStyle {
-    static let contentWidth: CGFloat = 1023
+    static let contentWidth: CGFloat = 1097
     static let contentHeight: CGFloat = 726
-    static let minContentWidth: CGFloat = 860
+    static let minContentWidth: CGFloat = 1097
     static let minContentHeight: CGFloat = 520
     static let shadowMargin: CGFloat = 0
     static let cornerRadius: CGFloat = 8
@@ -1163,6 +1226,43 @@ enum TaskManagerStyle {
     static let selectedRow = Color(red: 0.972, green: 0.972, blue: 0.972)
     static let text = Color(red: 0.055, green: 0.067, blue: 0.082)
     static let muted = Color(red: 0.365, green: 0.392, blue: 0.431)
+}
+
+enum AppArtwork {
+    static var displayIcon: NSImage? {
+        image(named: "app-icon", extension: "png") ?? image(named: "app-icon", extension: "svg")
+    }
+
+    static var applicationIcon: NSImage? {
+        image(named: "app-icon", extension: "png") ?? image(named: "app-icon", extension: "svg")
+    }
+
+    private static func image(named name: String, extension fileExtension: String) -> NSImage? {
+        if let url = Bundle.main.url(forResource: name, withExtension: fileExtension),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+
+        let fallbackURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("assets")
+            .appendingPathComponent("\(name).\(fileExtension)")
+        return NSImage(contentsOf: fallbackURL)
+    }
+}
+
+struct AppLogoImage: View {
+    var body: some View {
+        if let image = AppArtwork.displayIcon {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Image(systemName: "waveform.path.ecg")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundColor(Color(red: 0.184, green: 0.655, blue: 0.882))
+        }
+    }
 }
 
 struct ResourceSample {
@@ -1411,54 +1511,68 @@ struct ProcessTableCacheKey: Equatable {
 
 // MARK: - Views
 struct ContentView: View {
-    @StateObject private var monitor = SystemMonitor()
+    @ObservedObject var monitor: SystemMonitor
+    @ObservedObject var fanControl: FanControlModel
     @StateObject private var state = ContentViewState()
+    @StateObject private var authorization = FirstLaunchAuthorizationModel()
 
     var body: some View {
-        ZStack {
-            Color.clear
-            VStack(spacing: 0) {
-                TaskManagerTitleBar(state: state)
+        VStack(spacing: 0) {
+            TaskManagerTitleBar(state: state)
 
-                HStack(spacing: 0) {
-                    TaskManagerSidebar(state: state)
+            HStack(spacing: 0) {
+                TaskManagerSidebar(state: state)
 
-                    VStack(spacing: 0) {
-                        if state.selectedNav == 0 {
-                            TaskManagerCommandBar(monitor: monitor, state: state)
-                            TaskManagerProcessTable(monitor: monitor, state: state)
-                        } else {
-                            TaskManagerSecondaryPage(index: state.selectedNav, monitor: monitor, state: state)
-                        }
+                VStack(spacing: 0) {
+                    if state.selectedNav == NavigationIndex.settings {
+                        SettingsPage(state: state, fanControl: fanControl)
+                    } else if state.selectedNav == 0 {
+                        TaskManagerCommandBar(monitor: monitor, state: state)
+                        TaskManagerProcessTable(monitor: monitor, state: state)
+                    } else if state.selectedNav == NavigationIndex.fanControl {
+                        FanControlPage(model: fanControl)
+                    } else {
+                        TaskManagerSecondaryPage(index: state.selectedNav, monitor: monitor, state: state)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        TaskManagerFocus.clearSearchFocus()
-                    }
-                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background {
-                RoundedRectangle(cornerRadius: TaskManagerStyle.cornerRadius, style: .continuous)
-                    .fill(Color.white)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: TaskManagerStyle.cornerRadius, style: .continuous))
-            .padding(TaskManagerStyle.shadowMargin)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .simultaneousGesture(
+                TapGesture().onEnded {
+                    TaskManagerFocus.clearSearchFocus()
+                }
+            )
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white)
+        .overlay(alignment: .top) {
+            if let notice = fanControl.noticeMessage {
+                FanControlToast(message: notice)
+                    .padding(.top, 76)
+                    .transition(
+                        .move(edge: .top)
+                            .combined(with: .opacity)
+                    )
+                    .zIndex(100)
+            }
+        }
+        .ignoresSafeArea()
         .frame(
             minWidth: TaskManagerStyle.minContentWidth + TaskManagerStyle.shadowMargin * 2,
             maxWidth: .infinity,
             minHeight: TaskManagerStyle.minContentHeight + TaskManagerStyle.shadowMargin * 2,
             maxHeight: .infinity
         )
-        .background(Color.clear)
         .sheet(isPresented: $state.showRunTaskDialog) {
             RunTaskDialog(monitor: monitor, state: state)
         }
+        .sheet(isPresented: $authorization.isPresented) {
+            FirstLaunchAuthorizationView(model: authorization)
+        }
         .onAppear {
             state.selectedPID = nil
+            authorization.start()
         }
     }
 }
@@ -1484,14 +1598,8 @@ struct TaskManagerTitleBar: View {
         VStack(spacing: 0) {
             HStack(spacing: 18) {
                 HStack(spacing: 28) {
-                    ZStack {
-                        Rectangle()
-                            .fill(Color(red: 0.184, green: 0.655, blue: 0.882))
-                            .frame(width: 20, height: 16)
-                        Image(systemName: "waveform.path.ecg")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(.white)
-                    }
+                    AppLogoImage()
+                        .frame(width: 24, height: 24)
 
                     Text("任务管理器")
                         .font(.system(size: 17, weight: .medium))
@@ -1500,7 +1608,7 @@ struct TaskManagerTitleBar: View {
                 .frame(width: 272, alignment: .leading)
                 .padding(.leading, 22)
 
-                if state.selectedNav != 1 {
+                if state.selectedNav == 0 {
                     HStack(spacing: 12) {
                         Image(systemName: "magnifyingglass")
                             .font(.system(size: 15))
@@ -1603,16 +1711,16 @@ struct TaskManagerSidebar: View {
     let icons = [
         "square.grid.2x2",
         "waveform.path.ecg",
-        "clock.arrow.circlepath",
+        "fanblades",
         "speedometer",
         "person.2",
         "list.bullet",
-        "gearshape"
+        "puzzlepiece.extension"
     ]
     let labels = [
         "进程",
         "性能",
-        "应用历史记录",
+        "风扇控制",
         "启动应用",
         "用户",
         "详细信息",
@@ -1631,19 +1739,30 @@ struct TaskManagerSidebar: View {
                 .padding(.top, 7)
 
             ForEach(Array(icons.enumerated()), id: \.offset) { item in
+                let enabled = item.offset <= NavigationIndex.fanControl
                 SidebarButton(
                     icon: item.element,
                     label: labels[item.offset],
                     expanded: state.sidebarExpanded,
-                    selected: state.selectedNav == item.offset
+                    selected: enabled && state.selectedNav == item.offset,
+                    enabled: enabled
                 ) {
-                    state.selectedNav = item.offset
+                    if enabled {
+                        state.selectedNav = item.offset
+                    }
                 }
             }
 
             Spacer()
 
-            SidebarButton(icon: "gearshape", label: "设置", expanded: state.sidebarExpanded, selected: false) {}
+            SidebarButton(
+                icon: "gearshape",
+                label: "设置",
+                expanded: state.sidebarExpanded,
+                selected: state.selectedNav == NavigationIndex.settings
+            ) {
+                state.selectedNav = NavigationIndex.settings
+            }
                 .padding(.bottom, 14)
         }
         .frame(width: sidebarWidth)
@@ -1689,6 +1808,7 @@ struct SidebarButton: View {
     let label: String
     let expanded: Bool
     let selected: Bool
+    var enabled = true
     let action: () -> Void
     @StateObject private var hover = SidebarButtonHoverState()
 
@@ -1697,21 +1817,20 @@ struct SidebarButton: View {
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .fill(backgroundColor)
-                    .frame(width: expanded ? 176 : 50, height: selected ? 44 : 42)
-                    .offset(x: selected ? -1 : 0, y: selected ? 2 : 0)
-                if selected {
+                    .frame(width: expanded ? 176 : 50, height: 42)
+                if selected && !expanded {
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
                         .fill(Color(red: 0.000, green: 0.404, blue: 0.753))
-                        .frame(width: 5, height: 20)
-                        .offset(x: -2, y: 1)
+                        .frame(width: 4, height: 20)
+                        .offset(x: 2, y: 0)
                 }
                 HStack(spacing: 12) {
-                    SidebarFluentIcon(icon: icon)
+                    SidebarFluentIcon(icon: icon, color: iconColor)
                         .frame(width: 50, height: 42)
                     if expanded {
                         Text(label)
                             .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(TaskManagerStyle.text)
+                            .foregroundColor(iconColor)
                             .lineLimit(1)
                         Spacer(minLength: 0)
                     }
@@ -1720,17 +1839,23 @@ struct SidebarButton: View {
             .frame(width: expanded ? 176 : 50, height: 42, alignment: .leading)
         }
         .buttonStyle(.plain)
+        .disabled(!enabled)
         .frame(width: expanded ? 176 : 50, height: 42, alignment: .leading)
         .onHover { hovering in
-            hover.isHovered = hovering
+            hover.isHovered = enabled && hovering
         }
     }
 
     private var backgroundColor: Color {
+        guard enabled else { return Color.clear }
         if selected {
             return TaskManagerStyle.selectedSidebar
         }
         return hover.isHovered ? TaskManagerStyle.hoveredSidebar : Color.clear
+    }
+
+    private var iconColor: Color {
+        enabled ? TaskManagerStyle.text : Color(red: 0.620, green: 0.650, blue: 0.690)
     }
 }
 
@@ -1740,20 +1865,21 @@ final class SidebarButtonHoverState: ObservableObject {
 
 struct SidebarFluentIcon: View {
     let icon: String
+    var color = TaskManagerStyle.text
 
     var body: some View {
         ZStack {
             switch icon {
             case "square.grid.2x2":
                 ProcessGlyph()
-                    .stroke(TaskManagerStyle.text, style: SidebarIconMetrics.strokeStyle)
+                    .stroke(color, style: SidebarIconMetrics.strokeStyle)
                     .frame(width: SidebarIconMetrics.glyphSize, height: SidebarIconMetrics.glyphSize)
             case "waveform.path.ecg":
                 PerformanceGlyph()
-                    .stroke(TaskManagerStyle.text, style: SidebarIconMetrics.strokeStyle)
+                    .stroke(color, style: SidebarIconMetrics.strokeStyle)
                     .frame(width: SidebarIconMetrics.glyphSize, height: SidebarIconMetrics.glyphSize)
             default:
-                SidebarSystemIcon(icon: icon)
+                SidebarSystemIcon(icon: icon, color: color)
             }
         }
         .frame(width: SidebarIconMetrics.canvasSize, height: SidebarIconMetrics.canvasSize, alignment: .center)
@@ -1769,12 +1895,13 @@ private enum SidebarIconMetrics {
 
 struct SidebarSystemIcon: View {
     let icon: String
+    var color = TaskManagerStyle.text
 
     var body: some View {
         Image(systemName: icon)
             .font(.system(size: SidebarIconMetrics.symbolSize, weight: .regular))
             .symbolRenderingMode(.monochrome)
-            .foregroundColor(TaskManagerStyle.text)
+            .foregroundColor(color)
             .frame(width: SidebarIconMetrics.canvasSize, height: SidebarIconMetrics.canvasSize, alignment: .center)
     }
 }
@@ -1873,13 +2000,13 @@ struct TaskManagerCommandBar: View {
             CommandSeparator()
                 .offset(x: -3)
 
-            CommandButton(icon: "nosign", title: "结束任务", enabled: canEndTask) {
+            CommandButton(icon: "nosign", title: state.terminationMode.rawValue, enabled: canEndTask) {
                 if let process = selectedProcess {
                     confirmKill(process)
                 }
             }
 
-            CommandButton(icon: "leaf", title: "效率模式", enabled: selectedProcess != nil) {
+            CommandButton(icon: "leaf", title: "效率模式", enabled: false) {
                 if let process = selectedProcess {
                     if monitor.enableEfficiencyMode(pid: process.pid) {
                         state.efficiencyPIDs.insert(process.pid)
@@ -1909,15 +2036,16 @@ struct TaskManagerCommandBar: View {
     }
 
     func confirmKill(_ process: AppProcess) {
+        let mode = state.terminationMode
         let alert = NSAlert()
-        alert.messageText = "结束任务 \(process.name)?"
-        alert.informativeText = "PID: \(process.pid) - 未保存的数据可能丢失。"
+        alert.messageText = "\(mode.rawValue) \(process.name)?"
+        alert.informativeText = "PID: \(process.pid) - \(mode.confirmationDescription)"
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "结束任务")
+        alert.addButton(withTitle: mode.rawValue)
         alert.addButton(withTitle: "取消")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            monitor.killProcess(pid: process.pid, name: process.name)
+            monitor.killProcess(pid: process.pid, mode: mode)
         }
     }
 
@@ -1989,6 +2117,7 @@ struct CommandButton: View {
             .padding(.horizontal, 18)
         }
         .buttonStyle(.plain)
+        .disabled(!enabled)
     }
 }
 
@@ -2053,6 +2182,234 @@ struct RunTaskDialog: View {
         }
         .padding(22)
         .frame(width: 460)
+    }
+}
+
+final class RunningApplicationsPopoverState: ObservableObject {
+    @Published var selectedPID: Int32?
+}
+
+struct PopoverKillButton: View {
+    let processName: String
+    let mode: ProcessTerminationMode
+    let action: () -> Void
+    @StateObject private var hover = KillProcessButtonHoverState()
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "nosign")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundColor(TaskManagerStyle.text)
+                .frame(width: 28, height: 28)
+                .background {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(hover.isHovered ? TaskManagerStyle.hoveredSidebar : Color.clear)
+                }
+        }
+        .buttonStyle(.plain)
+        .help("\(mode.rawValue) \(processName)")
+        .onHover { hovering in
+            hover.isHovered = hovering
+        }
+    }
+}
+
+struct RunningApplicationsPopover: View {
+    @ObservedObject var monitor: SystemMonitor
+    @StateObject private var popoverState = RunningApplicationsPopoverState()
+
+    private let popoverWidth: CGFloat = 338
+    private let popoverHeight: CGFloat = 480
+    private let nameWidth: CGFloat = 196
+    private let actionWidth: CGFloat = 42
+    private let memoryWidth: CGFloat = 100
+    private let rowHeight: CGFloat = 42
+
+    private var appProcesses: [AppProcess] {
+        monitor.processes
+            .filter(\.isApp)
+            .sorted {
+                if $0.memoryUsage != $1.memoryUsage { return $0.memoryUsage > $1.memoryUsage }
+                if $0.cpuUsage != $1.cpuUsage { return $0.cpuUsage > $1.cpuUsage }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            columnHeader
+
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(spacing: 0) {
+                    if appProcesses.isEmpty {
+                        emptyState
+                    } else {
+                        ForEach(appProcesses) { process in
+                            popoverRow(process)
+                        }
+                    }
+                }
+                .padding(.bottom, 10)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.white)
+        }
+        .frame(width: popoverWidth, height: popoverHeight)
+        .background(TaskManagerStyle.chrome)
+        .onAppear {
+            monitor.updateData()
+            if let selectedPID = popoverState.selectedPID, !appProcesses.contains(where: { $0.pid == selectedPID }) {
+                popoverState.selectedPID = nil
+            }
+        }
+    }
+
+    private var columnHeader: some View {
+        HStack(spacing: 0) {
+            headerCell("名称", width: nameWidth, alignment: .leading, showsTrailingRule: false)
+            headerCell("", width: actionWidth, alignment: .center)
+            headerCell("内存", width: memoryWidth, alignment: .center)
+        }
+        .background(TaskManagerStyle.headerCell)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(TaskManagerStyle.grid)
+                .frame(height: 1)
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "app.dashed")
+                .font(.system(size: 26))
+                .foregroundColor(TaskManagerStyle.muted)
+            Text("暂无正在运行的应用")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(TaskManagerStyle.text)
+            Text("列表会随系统监控自动更新")
+                .font(.system(size: 12))
+                .foregroundColor(TaskManagerStyle.muted)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 188)
+        .background(Color.white)
+    }
+
+    private func popoverRow(_ process: AppProcess) -> some View {
+        let selected = popoverState.selectedPID == process.pid
+
+        return HStack(spacing: 0) {
+            HStack(spacing: 10) {
+                if let icon = process.icon {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 24, height: 24)
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                } else {
+                    AppInitialsIcon(name: process.name)
+                        .frame(width: 24, height: 24)
+                }
+
+                Text(process.name)
+                    .font(.system(size: 15))
+                    .foregroundColor(TaskManagerStyle.text)
+                    .lineLimit(1)
+            }
+            .padding(.leading, 14)
+            .frame(width: nameWidth, height: rowHeight, alignment: .leading)
+            .background(rowBackground(selected: selected))
+
+            HStack {
+                let mode = ProcessTerminationMode.current
+                PopoverKillButton(processName: process.name, mode: mode) {
+                    monitor.killProcess(pid: process.pid, mode: mode)
+                    if popoverState.selectedPID == process.pid {
+                        popoverState.selectedPID = nil
+                    }
+                }
+            }
+            .frame(width: actionWidth, height: rowHeight)
+            .background(rowBackground(selected: selected))
+            .overlay(alignment: .trailing) {
+                VerticalRule()
+            }
+
+            resourceText(formatMemory(process.memoryUsage), width: memoryWidth, intensity: memoryIntensity(process.memoryUsage))
+                .background(selected ? TaskManagerStyle.selectedSidebar : Color.clear)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            popoverState.selectedPID = process.pid
+        }
+    }
+
+    private func headerCell(_ title: String, width: CGFloat, alignment: Alignment, showsTrailingRule: Bool = true) -> some View {
+        Text(title)
+            .font(.system(size: 14))
+            .foregroundColor(TaskManagerStyle.muted)
+            .frame(width: width - 24, height: 36, alignment: alignment)
+            .padding(.horizontal, 12)
+            .overlay(alignment: .trailing) {
+                if showsTrailingRule {
+                    VerticalRule()
+                }
+            }
+    }
+
+    private func resourceText(_ text: String, width: CGFloat, intensity: Double) -> some View {
+        Text(text)
+            .font(.system(size: 15))
+            .foregroundColor(TaskManagerStyle.text)
+            .lineLimit(1)
+            .frame(width: width, height: rowHeight, alignment: .center)
+            .background(resourceColor(intensity))
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(Color(red: 0.700, green: 0.843, blue: 0.914))
+                    .frame(width: 1)
+            }
+    }
+
+    private func rowBackground(selected: Bool) -> Color {
+        selected ? TaskManagerStyle.selectedSidebar : Color.white
+    }
+
+    private func resourceColor(_ intensity: Double) -> Color {
+        let amount = min(max(intensity, 0), 1)
+        return Color(
+            red: 0.839 - 0.227 * amount,
+            green: 0.945 - 0.078 * amount,
+            blue: 1.000
+        )
+    }
+
+    private func memoryIntensity(_ bytes: UInt64) -> Double {
+        min(Double(bytes) / 1_048_576 / 900, 1)
+    }
+
+}
+
+struct AppInitialsIcon: View {
+    let name: String
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(Color(red: 0.580, green: 0.720, blue: 0.890))
+            Text(initials)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+        }
+    }
+
+    private var initials: String {
+        let letters = name
+            .split(separator: " ")
+            .compactMap { $0.first }
+            .prefix(2)
+        let value = String(letters).uppercased()
+        return value.isEmpty ? "AP" : value
     }
 }
 
@@ -2963,6 +3320,303 @@ struct MetricSummaryRow: View {
     }
 }
 
+struct SettingsPage: View {
+    @ObservedObject var state: ContentViewState
+    @ObservedObject var fanControl: FanControlModel
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text("设置")
+                    .font(.system(size: 23, weight: .semibold))
+                    .foregroundColor(TaskManagerStyle.text)
+                    .padding(.top, 22)
+                    .padding(.bottom, 26)
+
+                SettingsSectionTitle("外观")
+                SettingsOptionRow(
+                    icon: "paintpalette",
+                    title: "应用主题",
+                    subtitle: "选择要显示的应用主题"
+                ) {
+                    SettingsDropdown(
+                        selection: $state.appTheme,
+                        options: ["使用系统设置", "浅色", "深色"]
+                    )
+                }
+                .padding(.bottom, 30)
+
+                SettingsSectionTitle("常规")
+                SettingsOptionRow(
+                    icon: "rectangle.on.rectangle",
+                    title: "默认起始页",
+                    subtitle: "指定启动任务管理器时显示的页面"
+                ) {
+                    SettingsDropdown(
+                        selection: $state.defaultStartPage,
+                        options: ["进程", "性能", "应用历史记录", "启动应用", "用户", "详细信息", "服务"]
+                    )
+                }
+                .padding(.bottom, 12)
+
+                SettingsOptionRow(
+                    icon: "speedometer",
+                    title: "实时更新速度",
+                    subtitle: "选择更新系统资源使用情况报告的频率"
+                ) {
+                    SettingsDropdown(
+                        selection: $state.updateSpeed,
+                        options: ["高", "常规", "低", "已暂停"]
+                    )
+                }
+                .padding(.bottom, 12)
+
+                SettingsSectionTitle("进程")
+                SettingsOptionRow(
+                    icon: "xmark.octagon",
+                    title: "结束任务方式",
+                    subtitle: "选择结束进程时执行退出或强制退出"
+                ) {
+                    SettingsDropdown(
+                        selection: $state.processTerminationMode,
+                        options: ProcessTerminationMode.allCases.map(\.rawValue)
+                    )
+                }
+                .padding(.bottom, 12)
+
+                SettingsSectionTitle("散热")
+                SettingsOptionRow(
+                    icon: "snowflake",
+                    title: "清凉模式策略",
+                    subtitle: "选择清凉模式的降温与风噪取舍"
+                ) {
+                    SettingsDropdown(
+                        selection: Binding(
+                            get: { state.coolModePolicy },
+                            set: { rawValue in
+                                state.coolModePolicy = rawValue
+                                fanControl.setCoolModePolicy(
+                                    CoolModePolicy(rawValue: rawValue) ?? .comfort
+                                )
+                            }
+                        ),
+                        options: CoolModePolicy.allCases.map(\.rawValue)
+                    )
+                }
+                .padding(.bottom, 12)
+
+                SettingsExpandableCard(
+                    icon: "macwindow",
+                    title: "窗口管理",
+                    subtitle: "指定默认任务管理器窗口行为",
+                    expanded: $state.windowManagementExpanded
+                ) {
+                    VStack(spacing: 0) {
+                        SettingsCheckRow(title: "置于顶层", isOn: $state.alwaysOnTop)
+                        SettingsCheckRow(title: "使用时最小化", isOn: $state.minimizeOnUse)
+                        SettingsCheckRow(title: "最小化时隐藏", isOn: $state.hideWhenMinimized, showsDivider: false)
+                    }
+                    .frame(width: 290, alignment: .leading)
+                    .padding(.leading, 88)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 16)
+                    .padding(.bottom, 20)
+                }
+            }
+            .padding(.horizontal, 36)
+            .padding(.bottom, 28)
+        }
+        .background(TaskManagerStyle.chrome)
+    }
+}
+
+struct SettingsSectionTitle: View {
+    let title: String
+
+    init(_ title: String) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundColor(TaskManagerStyle.text)
+            .padding(.bottom, 14)
+    }
+}
+
+struct SettingsOptionRow<Control: View>: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let control: Control
+
+    init(icon: String, title: String, subtitle: String, @ViewBuilder control: () -> Control) {
+        self.icon = icon
+        self.title = title
+        self.subtitle = subtitle
+        self.control = control()
+    }
+
+    var body: some View {
+        HStack(spacing: 20) {
+            SettingsIcon(icon: icon)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundColor(TaskManagerStyle.text)
+                Text(subtitle)
+                    .font(.system(size: 13))
+                    .foregroundColor(TaskManagerStyle.muted)
+            }
+
+            Spacer(minLength: 22)
+            control
+        }
+        .padding(.horizontal, 30)
+        .frame(height: 92)
+        .settingsCardStyle()
+    }
+}
+
+struct SettingsExpandableCard<Content: View>: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    @Binding var expanded: Bool
+    let content: Content
+
+    init(icon: String, title: String, subtitle: String, expanded: Binding<Bool>, @ViewBuilder content: () -> Content) {
+        self.icon = icon
+        self.title = title
+        self.subtitle = subtitle
+        self._expanded = expanded
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 20) {
+                    SettingsIcon(icon: icon)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.system(size: 16))
+                            .foregroundColor(TaskManagerStyle.text)
+                        Text(subtitle)
+                            .font(.system(size: 13))
+                            .foregroundColor(TaskManagerStyle.muted)
+                    }
+
+                    Spacer()
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(TaskManagerStyle.text)
+                        .frame(width: 24, height: 24)
+                }
+                .padding(.horizontal, 30)
+                .frame(height: 92)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                Rectangle()
+                    .fill(TaskManagerStyle.grid)
+                    .frame(height: 1)
+                content
+            }
+        }
+        .settingsCardStyle()
+    }
+}
+
+struct SettingsCheckRow: View {
+    let title: String
+    @Binding var isOn: Bool
+    var showsDivider = true
+
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            Text(title)
+                .font(.system(size: 15))
+                .foregroundColor(TaskManagerStyle.text)
+        }
+        .toggleStyle(.checkbox)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 60, alignment: .leading)
+        .overlay(alignment: .bottom) {
+            if showsDivider {
+                Rectangle()
+                    .fill(TaskManagerStyle.grid.opacity(0.72))
+                    .frame(height: 1)
+            }
+        }
+    }
+}
+
+struct SettingsDropdown: View {
+    @Binding var selection: String
+    let options: [String]
+
+    var body: some View {
+        Menu {
+            ForEach(options, id: \.self) { option in
+                Button(option) {
+                    selection = option
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Text(selection)
+                    .font(.system(size: 15))
+                    .foregroundColor(TaskManagerStyle.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(TaskManagerStyle.muted)
+            }
+            .padding(.horizontal, 16)
+            .frame(width: 198, height: 44)
+            .background(Color.white)
+            .overlay {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(Color(red: 0.835, green: 0.847, blue: 0.867), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct SettingsIcon: View {
+    let icon: String
+
+    var body: some View {
+        Image(systemName: icon)
+            .font(.system(size: 20, weight: .regular))
+            .symbolRenderingMode(.monochrome)
+            .foregroundColor(TaskManagerStyle.text)
+            .frame(width: 32, height: 32)
+    }
+}
+
+private extension View {
+    func settingsCardStyle() -> some View {
+        self
+            .background(Color.white)
+            .overlay {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(Color(red: 0.872, green: 0.884, blue: 0.902), lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+}
+
 struct SimpleDataTable: View {
     let columns: [String]
     let rows: [[String]]
@@ -3070,11 +3724,12 @@ struct TaskManagerProcessTable: View {
                             actionWidth: actionWidth,
                             metricWidth: metricWidth,
                             sample: resourceSample(for: row.resources),
+                            terminationMode: state.terminationMode,
                             onToggleExpanded: {
                                 toggleExpanded(row.process.pid)
                             },
                             onKillProcess: {
-                                monitor.killProcess(pid: row.process.pid, name: row.process.name)
+                                monitor.killProcess(pid: row.process.pid, mode: state.terminationMode)
                             }
                         )
                         .onTapGesture {
@@ -3101,11 +3756,12 @@ struct TaskManagerProcessTable: View {
                             actionWidth: actionWidth,
                             metricWidth: metricWidth,
                             sample: resourceSample(for: row.resources),
+                            terminationMode: state.terminationMode,
                             onToggleExpanded: {
                                 toggleExpanded(row.process.pid)
                             },
                             onKillProcess: {
-                                monitor.killProcess(pid: row.process.pid, name: row.process.name)
+                                monitor.killProcess(pid: row.process.pid, mode: state.terminationMode)
                             }
                         )
                         .onTapGesture {
@@ -3286,6 +3942,7 @@ struct ProcessTableRow: View {
     let actionWidth: CGFloat
     let metricWidth: CGFloat
     let sample: ResourceSample
+    let terminationMode: ProcessTerminationMode
     let onToggleExpanded: () -> Void
     let onKillProcess: () -> Void
 
@@ -3332,7 +3989,7 @@ struct ProcessTableRow: View {
                 VerticalRule()
             }
 
-            KillProcessButton(action: onKillProcess)
+            KillProcessButton(title: terminationMode.rawValue, action: onKillProcess)
                 .frame(width: actionWidth, height: 34)
             .background(selected ? TaskManagerStyle.selectedRow : Color.white)
             .overlay(alignment: .trailing) {
@@ -3401,6 +4058,7 @@ struct ProcessTableRow: View {
 }
 
 struct KillProcessButton: View {
+    let title: String
     let action: () -> Void
     @StateObject private var hover = KillProcessButtonHoverState()
 
@@ -3411,7 +4069,7 @@ struct KillProcessButton: View {
                 HStack(spacing: 6) {
                     Image(systemName: "nosign")
                         .font(.system(size: 15, weight: .medium))
-                    Text("结束任务")
+                    Text(title)
                         .font(.system(size: 14, weight: .medium))
                 }
                 .foregroundColor(TaskManagerStyle.text)
@@ -3422,7 +4080,7 @@ struct KillProcessButton: View {
                 }
             }
             .buttonStyle(.plain)
-            .help("结束进程")
+            .help("\(title)进程")
             .onHover { hovering in
                 hover.isHovered = hovering
             }
@@ -3479,9 +4137,115 @@ struct VerticalRule: View {
 }
 
 // MARK: - App
+@MainActor
+final class MenuBarStatusController: NSObject {
+    private let monitor: SystemMonitor
+    private let statusItem: NSStatusItem
+    private let popover: NSPopover
+
+    init(monitor: SystemMonitor) {
+        self.monitor = monitor
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        self.popover = NSPopover()
+        super.init()
+
+        configureStatusItem()
+        configurePopover()
+    }
+
+    func invalidate() {
+        popover.close()
+        NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        guard let button = statusItem.button else { return }
+
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    private func configureStatusItem() {
+        guard let button = statusItem.button else { return }
+
+        let image = Self.makeStatusBarImage()
+
+        button.image = image
+        button.alternateImage = image
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.toolTip = "正在运行的应用"
+        button.target = self
+        button.action = #selector(togglePopover(_:))
+    }
+
+    private static func makeStatusBarImage() -> NSImage {
+        if let source = AppArtwork.displayIcon,
+           let image = source.copy() as? NSImage {
+            image.size = NSSize(width: 18, height: 18)
+            image.isTemplate = false
+            image.accessibilityDescription = "正在运行的应用"
+            return image
+        }
+
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: rect.minX + 1, y: rect.midY))
+            path.line(to: NSPoint(x: rect.minX + 4, y: rect.midY))
+            path.line(to: NSPoint(x: rect.minX + 6, y: rect.midY + 5))
+            path.line(to: NSPoint(x: rect.minX + 8.5, y: rect.midY - 6))
+            path.line(to: NSPoint(x: rect.minX + 11, y: rect.midY + 3))
+            path.line(to: NSPoint(x: rect.minX + 13, y: rect.midY))
+            path.line(to: NSPoint(x: rect.maxX - 1, y: rect.midY))
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+
+            NSColor.black.withAlphaComponent(0.55).setStroke()
+            path.lineWidth = 3.4
+            path.stroke()
+
+            NSColor.white.setStroke()
+            path.lineWidth = 1.8
+            path.stroke()
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "正在运行的应用"
+        return image
+    }
+
+    private func configurePopover() {
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 338, height: 480)
+        popover.contentViewController = NSHostingController(
+            rootView: RunningApplicationsPopover(monitor: monitor)
+        )
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let monitor: SystemMonitor
+    let fanControl: FanControlModel
+    private var menuBarStatusController: MenuBarStatusController?
+
+    override init() {
+        let monitor = SystemMonitor()
+        self.monitor = monitor
+        self.fanControl = FanControlModel(monitor: monitor)
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        if let applicationIcon = AppArtwork.applicationIcon {
+            NSApp.applicationIconImage = applicationIcon
+        }
+        menuBarStatusController = MenuBarStatusController(monitor: monitor)
         DispatchQueue.main.async {
             self.configureWindows()
             NSApp.activate(ignoringOtherApps: true)
@@ -3492,21 +4256,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        menuBarStatusController?.invalidate()
+        fanControl.shutdown()
+    }
+
     private func configureWindows() {
         for window in NSApp.windows {
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            window.styleMask = [.borderless, .resizable, .miniaturizable]
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
             window.hasShadow = true
-            window.isOpaque = false
-            window.backgroundColor = .clear
+            window.isOpaque = true
+            window.backgroundColor = .white
             window.isMovableByWindowBackground = true
             window.contentView?.wantsLayer = true
-            window.contentView?.layer?.backgroundColor = NSColor.clear.cgColor
+            window.contentView?.layer?.backgroundColor = NSColor.white.cgColor
+            window.contentView?.layer?.cornerRadius = 0
+            window.contentView?.layer?.masksToBounds = false
             window.contentView?.superview?.wantsLayer = true
-            window.contentView?.superview?.layer?.backgroundColor = NSColor.clear.cgColor
+            window.contentView?.superview?.layer?.backgroundColor = NSColor.white.cgColor
+            window.contentView?.superview?.layer?.cornerRadius = 0
+            window.contentView?.superview?.layer?.masksToBounds = false
             window.contentViewController?.view.wantsLayer = true
-            window.contentViewController?.view.layer?.backgroundColor = NSColor.clear.cgColor
+            window.contentViewController?.view.layer?.backgroundColor = NSColor.white.cgColor
+            window.contentViewController?.view.layer?.cornerRadius = 0
+            window.contentViewController?.view.layer?.masksToBounds = false
             window.standardWindowButton(.closeButton)?.isHidden = true
             window.standardWindowButton(.miniaturizeButton)?.isHidden = true
             window.standardWindowButton(.zoomButton)?.isHidden = true
@@ -3524,12 +4299,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct MacSystemMonitorApp: App {
+struct MacTaskManagerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        WindowGroup("系统监视器") {
-            ContentView()
+        WindowGroup("Mac-TaskManager") {
+            ContentView(monitor: appDelegate.monitor, fanControl: appDelegate.fanControl)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(
