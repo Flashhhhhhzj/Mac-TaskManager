@@ -4445,89 +4445,15 @@ struct VerticalRule: View {
 }
 
 // MARK: - App
-@MainActor
-final class MenuBarStatusController: NSObject {
-    private let monitor: SystemMonitor
-    private let statusItem: NSStatusItem
-    private let popover: NSPopover
-
-    init(monitor: SystemMonitor) {
-        self.monitor = monitor
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        self.popover = NSPopover()
-        super.init()
-
-        // Give Control Center a stable, versioned status-item identity instead of
-        // reusing the automatically generated Item-0 identity from earlier builds.
-        statusItem.autosaveName = "MacTaskManager.StatusItem.v2"
-        statusItem.isVisible = true
-        configureStatusItem()
-        configurePopover()
-    }
-
-    func invalidate() {
-        popover.close()
-        NSStatusBar.system.removeStatusItem(statusItem)
-    }
-
-    func reassertVisibility() {
-        statusItem.isVisible = true
-    }
-
-    @objc private func togglePopover(_ sender: Any?) {
-        guard let button = statusItem.button else { return }
-
-        if popover.isShown {
-            popover.performClose(sender)
-        } else {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        }
-    }
-
-    private func configureStatusItem() {
-        guard let button = statusItem.button else { return }
-
-        let image = Self.makeStatusBarImage()
-        button.image = image
-        button.alternateImage = image
-        button.imagePosition = .imageOnly
-        button.imageScaling = .scaleProportionallyDown
-        button.toolTip = "正在运行的应用"
-        button.target = self
-        button.action = #selector(togglePopover(_:))
-    }
-
-    private static func makeStatusBarImage() -> NSImage {
-        let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size, flipped: false) { rect in
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: rect.minX + 1, y: rect.midY))
-            path.line(to: NSPoint(x: rect.minX + 4, y: rect.midY))
-            path.line(to: NSPoint(x: rect.minX + 6, y: rect.midY + 5))
-            path.line(to: NSPoint(x: rect.minX + 8.5, y: rect.midY - 6))
-            path.line(to: NSPoint(x: rect.minX + 11, y: rect.midY + 3))
-            path.line(to: NSPoint(x: rect.minX + 13, y: rect.midY))
-            path.line(to: NSPoint(x: rect.maxX - 1, y: rect.midY))
-            path.lineCapStyle = .round
-            path.lineJoinStyle = .round
-
-            NSColor.black.setStroke()
-            path.lineWidth = 1.8
-            path.stroke()
-            return true
-        }
-        image.isTemplate = true
-        image.accessibilityDescription = "正在运行的应用"
-        return image
-    }
-
-    private func configurePopover() {
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentSize = NSSize(width: 338, height: 480)
-        popover.contentViewController = NSHostingController(
-            rootView: RunningApplicationsPopover(monitor: monitor)
-        )
+/// Uses SwiftUI's system-managed menu-bar scene instead of an unmanaged
+/// `NSStatusItem`. This lets macOS render the one status icon correctly on
+/// every display while keeping the existing running-applications view intact.
+private struct MenuBarApplicationsIcon: View {
+    var body: some View {
+        Image(systemName: "waveform.path.ecg")
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: 14, weight: .semibold))
+            .accessibilityLabel("正在运行的应用")
     }
 }
 
@@ -4535,7 +4461,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let monitoringLogs: MonitoringLogRecorder
     let monitor: SystemMonitor
     let fanControl: FanControlModel
-    private var menuBarStatusController: MenuBarStatusController?
 
     override init() {
         let monitoringLogs = MonitoringLogRecorder()
@@ -4551,14 +4476,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let applicationIcon = AppArtwork.applicationIcon {
             NSApp.applicationIconImage = applicationIcon
         }
-        menuBarStatusController = MenuBarStatusController(monitor: monitor)
         DispatchQueue.main.async {
             self.fanControl.startBackgroundLoggingIfNeeded()
             self.configureWindows()
             NSApp.activate(ignoringOtherApps: true)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.menuBarStatusController?.reassertVisibility()
         }
     }
 
@@ -4567,7 +4488,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        menuBarStatusController?.invalidate()
         fanControl.shutdown()
         monitoringLogs.shutdown()
     }
@@ -4630,5 +4550,12 @@ struct MacTaskManagerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
+
+        MenuBarExtra {
+            RunningApplicationsPopover(monitor: appDelegate.monitor)
+        } label: {
+            MenuBarApplicationsIcon()
+        }
+        .menuBarExtraStyle(.window)
     }
 }
