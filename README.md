@@ -1,56 +1,148 @@
-# Mac-TaskManager
+<p align="center">
+  <img src="assets/app-icon-display.png" width="112" alt="Mac-TaskManager 图标" />
+</p>
 
-A Windows Task Manager-inspired system monitor that runs natively on macOS.
+<h1 align="center">Mac-TaskManager</h1>
 
-> **This is not Windows.**
-> The screenshot below is from a real macOS desktop. Mac-TaskManager is a native Mac app with a Windows Task Manager-style interface, not a Windows VM, not Parallels, and not a remote desktop session.
->
-> **这不是 Windows 里的截图。** 这是运行在 macOS 上的原生应用，只是界面故意做成了 Windows 任务管理器的风格。
+<p align="center">
+  <strong>给 macOS 的原生任务管理器：看清负载，提前散热，始终把控制权留给你。</strong>
+</p>
 
-![Mac-TaskManager running natively on macOS](assets/macos-task-manager-on-mac.png)
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-13%2B-111827?style=for-the-badge&logo=apple&logoColor=white" alt="macOS 13+" />
+  <img src="https://img.shields.io/badge/Native-Swift%20%2B%20SwiftUI-0A84FF?style=for-the-badge&logo=swift&logoColor=white" alt="Native Swift and SwiftUI" />
+  <img src="https://img.shields.io/badge/Monitoring-Local--first-14B8A6?style=for-the-badge" alt="Local first monitoring" />
+  <img src="https://img.shields.io/badge/Fan%20control-Safe%20bounds-F59E0B?style=for-the-badge" alt="Safe fan control bounds" />
+</p>
 
-## Features
+<p align="center">
+  不是虚拟机，不是远程桌面，也不是套壳网页。<br />
+  <strong>Mac-TaskManager</strong> 是一款原生 macOS 应用，用 Windows 任务管理器的高信息密度视图，呈现 Mac 的真实运行状态。
+</p>
 
-- Process list with CPU, memory, disk, and network activity.
-- App and background process grouping.
-- Expandable process rows for child processes.
-- Search by process name, publisher/user, or PID.
-- Run task, end task, and efficiency mode actions.
-- Live AppleSMC fan status and temperature sensor list, with safe-range manual RPM control and one-click restore to macOS automatic control.
-- macOS-native SwiftUI/AppKit implementation with a Windows Task Manager-inspired look.
+<p align="center">
+  <img src="assets/macos-task-manager-on-mac.png" alt="Mac-TaskManager 运行于 macOS" width="900" />
+</p>
 
-## Build
+---
 
-Requirements:
+## 你能得到什么
 
-- macOS
-- Xcode Command Line Tools or a Swift toolchain
-- A valid `Developer ID Application` signing identity for the privileged fan helper
+| 模块 | 不只是“看数据” |
+| --- | --- |
+| **进程** | 按应用与后台进程分组，展开子进程；实时查看 CPU、GPU、内存、磁盘、网络与 PID；支持搜索、运行新任务、退出或强制退出。 |
+| **性能** | 以任务管理器式视图集中呈现系统资源状态，帮助你迅速定位“谁在吃资源”。 |
+| **风扇** | 读取 AppleSMC 风扇与温度传感器；手动转速永远钳制在当前硬件报告的安全最小/最大 RPM 之间，可一键交还 macOS 自动控制。 |
+| **清凉模式** | 不只按当前温度查表：结合 CPU、GPU、内存、磁盘吞吐、SMC 温度与升温趋势，提前判断散热压力并主动调节风扇。 |
+| **诊断日志** | 默认不留存。你可以主动开启最近 60 分钟的本地监控、风扇与清凉模式决策记录，再导出为 ZIP 诊断包。 |
+| **原生体验** | 支持浅色、深色、跟随系统主题；保留 Dock 图标与顶部状态栏入口，点击状态栏可快速查看正在运行的应用。 |
 
-Build and package the app:
+## 一眼看懂清凉模式
 
-```sh
-./build.sh
+清凉模式的目标不是宣称“直接测得键盘或掌托表面温度”——应用并不这样做。它是一个本地、确定性的短时散热压力预测器：在系统温度真正冲高前，先根据工作负载和温升趋势提高散热力度。
+
+```text
+CPU / GPU 占用 ─┐
+内存 / 磁盘吞吐 ├─> 负载平滑 + SMC 温度反馈 + 温升趋势
+温度传感器     ─┘                │
+                                 ▼
+                    预测散热压力（低 / 中 / 高）
+                                 │
+                                 ▼
+        策略映射 → 每个风扇的安全 RPM 区间 → 签名验证的 XPC Helper
+                                 │
+                                 ▼
+                    快速升速 · 缓慢降速 · 滞后防抖
 ```
 
-To select a specific signing identity:
+| 策略 | 适合谁 | 行为 |
+| --- | --- | --- |
+| **静音平衡** | 更在意风噪 | 明显升温后再积极提高转速。 |
+| **舒适优先**（默认） | 日常办公与编译 | 更早介入散热，兼顾机身舒适度与噪声。 |
+| **极致降温** | 长时间高负载 | 优先压低温升，允许更高的风扇转速。 |
+
+清凉模式运行时会接管风扇卡片，避免手动调速与算法互相覆盖；关闭模式、手动设置、恢复自动、读取失败、XPC 失败或心跳超时，都会让已接管的风扇回到 macOS 自动控制。Helper 连续约 10 秒收不到心跳也会主动恢复自动散热。
+
+## 权限与安全边界
+
+### 开箱即用的部分
+
+- 进程、CPU、GPU、内存、磁盘、网络与可读取的温度数据：无需额外管理员权限。
+- 没有可读取风扇的机型会明确显示不支持，不会伪造控制能力。
+
+### 需要一次性授权的部分
+
+写入风扇转速属于系统级操作。首次启用完整风扇控制时，应用会引导你安装并批准签名验证的 `MacFanHelper` 后台服务：
+
+1. 在应用内点击“授权并启用”；
+2. 按 macOS 指引到“系统设置 → 通用 → 登录项与扩展”完成批准；
+3. 返回应用后即可使用手动转速与清凉模式，日常操作无需反复输入密码。
+
+这是 macOS 的安全模型：应用不能替用户静默批准 root 后台服务。后续版本升级时，请递增 `APP_BUILD_NUMBER`，使系统按新签名和新路径刷新 Helper 注册。
+
+> 手动设置和清凉模式都不会突破硬件报告的 RPM 边界。应用退出、清凉模式异常或后台心跳中断时，风扇会恢复为 macOS 自动策略。
+
+## 隐私与运行日志
+
+默认情况下，Mac-TaskManager **不保存历史监控日志**。设置中的“保存监控日志”开关由你决定：
+
+- **关闭（默认）**：不保留历史；导出仅含当下的完整快照。
+- **开启**：本地滚动保存最近 **60 分钟** 的系统采样、进程与子进程信息、资源指标、风扇读数和清凉模式决策；存储上限为 **256 MB**。
+- **导出**：生成 ZIP 归档，包含 `manifest.json`、当前快照和可用的历史 JSONL 分段；文件只写入你在保存面板选择的位置，不会由该功能上传网络。
+
+这使日志既能用于复现高负载、风扇响应或算法判断，又不会在未经你同意时长期留存。
+
+## 快速开始
+
+### 安装发布版 DMG
+
+1. 打开 `Mac-TaskManager.dmg`，将 **Mac-TaskManager** 拖到“应用程序”。
+2. 从“应用程序”启动它；Dock 和状态栏都会保留入口。
+3. 直接使用进程与性能页。需要风扇控制时，再根据首次引导完成一次系统批准。
+4. 在“设置”中选择主题、结束任务方式、清凉模式策略，以及是否保存监控日志。
+
+### 从源码构建
+
+**要求**
+
+- macOS 13 或更高版本；
+- 完整 Xcode 或可用的 Swift 工具链；
+- 用于构建可安装风扇 Helper 的 `Developer ID Application` 签名身份。
+
+```sh
+git clone https://github.com/Flashhhhhhzj/Mac-TaskManager.git
+cd Mac-TaskManager
+
+# 编译、签名并生成 Mac-TaskManager.app
+./build.sh
+
+# 启动已构建应用
+open Mac-TaskManager.app
+```
+
+如果需要指定签名身份：
 
 ```sh
 CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" ./build.sh
 ```
 
-Release builds must use a monotonically increasing `APP_BUILD_NUMBER`. The app
-uses it to re-register the signed helper after an update, as required by
-`SMAppService` when the helper executable or launchd plist changes:
+运行清凉模式算法自检：
 
 ```sh
-APP_VERSION="1.0.0" APP_BUILD_NUMBER="100" ./build.sh dmg
+swift run -c release CoolModeAlgorithmChecks
 ```
 
-For a distributable release, first store App Store Connect notarization
-credentials in a Keychain profile, then pass that profile to the build. The
-script signs the DMG, submits it to Apple, staples the ticket, and validates the
-result:
+## 打包可分发 DMG
+
+构建发布包时，版本号和构建号都应明确指定；其中 `APP_BUILD_NUMBER` 必须单调递增，以便更新后重新注册 Helper。
+
+```sh
+APP_VERSION="1.0.0" \
+APP_BUILD_NUMBER="100" \
+./build.sh dmg
+```
+
+面向外部用户分发时，请使用 Apple 公证。先在钥匙串创建 App Store Connect 凭据配置文件，再提供其名称：
 
 ```sh
 APP_VERSION="1.0.0" \
@@ -59,31 +151,34 @@ NOTARY_PROFILE="MacTaskManager-Notary" \
 ./build.sh dmg
 ```
 
-If `NOTARY_PROFILE` is omitted, the script prints a warning and the resulting
-DMG is for local testing only.
+脚本会签名 App 和 DMG，并在提供 `NOTARY_PROFILE` 时提交公证、装订票据和验证结果。未提供该配置时，生成的 DMG 仅适合本地测试，不应直接对外发布。
 
-Run it:
+## 架构速览
 
-```sh
-open Mac-TaskManager.app
+```text
+Mac-TaskManager.app
+├── MacTaskManager          SwiftUI / AppKit 主应用
+│   ├── SystemMonitor       进程与系统资源采样
+│   ├── FanControl          风扇状态、清凉模式与 UI 状态
+│   └── MonitoringLog       可选本地历史与 ZIP 导出
+├── MacSMC                  AppleSMC 读取、算法、XPC 协议
+└── MacFanHelper            经 macOS 批准的特权后台服务
+    └── RPM 写入、范围校验、清凉模式心跳失联保护
 ```
 
-Or run the built executable directly:
+## 设计原则
 
-```sh
-./Mac-TaskManager
-```
+- **本地优先**：监控、预测和日志都在本机完成。
+- **看得懂**：使用熟悉的 Windows 任务管理器信息架构，但数据与行为完全来自 macOS。
+- **默认安全**：风扇写入有硬件边界、Helper 签名校验、异常自动恢复和明确的系统授权流程。
+- **不给假承诺**：没有支持的风扇、温度或权限，就明确告诉你，而不是展示失真的数据。
 
-## Notes
+## 第三方声明
 
-Mac-TaskManager intentionally borrows the visual language of Windows Task Manager, but all process data comes from macOS system APIs and command line tools.
+第三方组件与声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-Fan status is read locally from AppleSMC. On first launch, the app explains and
-registers its signed macOS LaunchDaemon. macOS requires the user to personally
-approve this system-level service; the app cannot grant that permission
-silently. After the one-time approval, later RPM changes use a
-signature-validated XPC connection and don't prompt for the password again.
-When a release updates the helper, increasing `APP_BUILD_NUMBER` makes the app
-refresh the registration before using the new helper. Changes remain limited to
-the minimum/maximum RPM reported by the hardware. Fanless Macs show the page as
-unsupported.
+---
+
+<p align="center">
+  <strong>少一点“电脑为什么这么烫”的猜测，多一点真正可见、可控的系统状态。</strong>
+</p>
