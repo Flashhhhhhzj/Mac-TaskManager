@@ -179,5 +179,7 @@ if [ "${1:-}" = "dmg" ]; then
 fi
 
 if [ "${1:-}" = "run" ]; then
-    open -n "$APP_DIR"
+    # Reuse the existing application instance. `open -n` launches multiple
+    # copies of the same bundle, which creates competing status-bar items.
+    open "$APP_DIR"
 fi

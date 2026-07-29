@@ -4445,15 +4445,85 @@ struct VerticalRule: View {
 }
 
 // MARK: - App
-/// Uses SwiftUI's system-managed menu-bar scene instead of an unmanaged
-/// `NSStatusItem`. This lets macOS render the one status icon correctly on
-/// every display while keeping the existing running-applications view intact.
-private struct MenuBarApplicationsIcon: View {
-    var body: some View {
-        Image(systemName: "waveform.path.ecg")
-            .symbolRenderingMode(.monochrome)
-            .font(.system(size: 14, weight: .semibold))
-            .accessibilityLabel("正在运行的应用")
+@MainActor
+final class MenuBarStatusController: NSObject {
+    private static let itemWidth: CGFloat = 24
+
+    private let monitor: SystemMonitor
+    private let statusItem: NSStatusItem
+    private let popover: NSPopover
+
+    init(monitor: SystemMonitor) {
+        self.monitor = monitor
+        self.statusItem = NSStatusBar.system.statusItem(withLength: Self.itemWidth)
+        self.popover = NSPopover()
+        super.init()
+
+        // Do not give this item an autosave name. On current macOS releases
+        // the menu-bar agent persists an item's placement under that identity;
+        // a restored hidden/overflow placement can then survive app updates.
+        // A regular status item should start in the visible system placement.
+        statusItem.isVisible = true
+        configureStatusButton()
+        configurePopover()
+    }
+
+    func invalidate() {
+        popover.close()
+        NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    /// The menu-bar agent restores its layout asynchronously during launch.
+    /// Reapply visibility after that restoration so a newly installed app does
+    /// not inherit an off-menu/overflow placement from an earlier item.
+    func reassertVisibility() {
+        statusItem.isVisible = true
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            showPopover()
+        }
+    }
+
+    private func configureStatusButton() {
+        guard let button = statusItem.button else { return }
+
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 14,
+            weight: .medium,
+            scale: .medium
+        )
+        let image = NSImage(
+            systemSymbolName: "waveform.path.ecg",
+            accessibilityDescription: "正在运行的应用"
+        )?.withSymbolConfiguration(configuration)
+        image?.isTemplate = true
+
+        button.title = ""
+        button.image = image
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
+        button.toolTip = "正在运行的应用"
+
+        button.target = self
+        button.action = #selector(togglePopover(_:))
+    }
+
+    private func configurePopover() {
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 338, height: 480)
+        popover.contentViewController = NSHostingController(
+            rootView: RunningApplicationsPopover(monitor: monitor)
+        )
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button, !popover.isShown else { return }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 }
 
@@ -4461,6 +4531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let monitoringLogs: MonitoringLogRecorder
     let monitor: SystemMonitor
     let fanControl: FanControlModel
+    private var menuBarStatusController: MenuBarStatusController?
 
     override init() {
         let monitoringLogs = MonitoringLogRecorder()
@@ -4479,7 +4550,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             self.fanControl.startBackgroundLoggingIfNeeded()
             self.configureWindows()
+            // The appearance is finalized by configureWindows(). Creating the
+            // template status image only afterwards prevents the menu-bar
+            // renderer from retaining the launch-time appearance snapshot.
+            self.menuBarStatusController = MenuBarStatusController(monitor: self.monitor)
             NSApp.activate(ignoringOtherApps: true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.menuBarStatusController?.reassertVisibility()
         }
     }
 
@@ -4488,6 +4566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        menuBarStatusController?.invalidate()
         fanControl.shutdown()
         monitoringLogs.shutdown()
     }
@@ -4550,12 +4629,5 @@ struct MacTaskManagerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
-
-        MenuBarExtra {
-            RunningApplicationsPopover(monitor: appDelegate.monitor)
-        } label: {
-            MenuBarApplicationsIcon()
-        }
-        .menuBarExtraStyle(.window)
     }
 }
