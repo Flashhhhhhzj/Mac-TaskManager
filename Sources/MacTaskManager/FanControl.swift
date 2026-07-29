@@ -98,6 +98,7 @@ final class FanControlModel: ObservableObject {
     @Published private(set) var coolModePolicy: CoolModePolicy
 
     private let monitor: SystemMonitor
+    private let monitoringLogs: MonitoringLogRecorder
     private let queue = DispatchQueue(label: "Mac-TaskManager.fan-control", qos: .userInitiated)
     private let temperatureHistoryLimit = 30
     private var refreshTimer: Timer?
@@ -108,8 +109,9 @@ final class FanControlModel: ObservableObject {
     private var hasAppliedCoolModeTargets = false
     private var coolModeAlgorithm = CoolModeAlgorithm()
 
-    init(monitor: SystemMonitor) {
+    init(monitor: SystemMonitor, monitoringLogs: MonitoringLogRecorder) {
         self.monitor = monitor
+        self.monitoringLogs = monitoringLogs
         self.coolModePolicy = CoolModePreferences.currentPolicy
     }
 
@@ -121,6 +123,14 @@ final class FanControlModel: ObservableObject {
 
     func stop() {
         isFanPageVisible = false
+        updateRefreshTimer()
+    }
+
+    func startBackgroundLoggingIfNeeded() {
+        updateRefreshTimer()
+    }
+
+    func setMonitoringLogPersistenceEnabled(_: Bool) {
         updateRefreshTimer()
     }
 
@@ -148,6 +158,7 @@ final class FanControlModel: ObservableObject {
                         : ""
                     self.isLoading = false
                     self.refreshInProgress = false
+                    self.recordFanSnapshot()
                     self.evaluateCoolModeIfNeeded()
                 }
             } catch {
@@ -168,7 +179,10 @@ final class FanControlModel: ObservableObject {
     }
 
     private func updateRefreshTimer() {
-        let shouldRefresh = isFanPageVisible || coolModeState.keepsControlLoopAlive
+        let shouldRefresh =
+            isFanPageVisible
+            || coolModeState.keepsControlLoopAlive
+            || monitoringLogs.isPersistenceEnabled
         if shouldRefresh, refreshTimer == nil {
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
                 self?.refresh(showLoading: false)
@@ -309,6 +323,10 @@ final class FanControlModel: ObservableObject {
         guard coolModePolicy != policy else { return }
         coolModePolicy = policy
         coolModeAlgorithm.reset()
+        recordCoolModeDecision(
+            event: "policyChanged",
+            message: "清凉模式策略已切换为 \(policy.rawValue)"
+        )
 
         if coolModeState.isEnabled {
             refresh(showLoading: false)
@@ -325,6 +343,7 @@ final class FanControlModel: ObservableObject {
 
     func shutdown() {
         guard hasAppliedCoolModeTargets else { return }
+        recordCoolModeDecision(event: "shutdown")
         try? PrivilegedFanControl.stopCoolMode()
         hasAppliedCoolModeTargets = false
         coolModeState = .off
@@ -339,6 +358,10 @@ final class FanControlModel: ObservableObject {
         helperAuthorizationState = helperState
         guard helperState.isEnabled else {
             errorMessage = "请先完成一次性授权，再启用清凉模式。"
+            recordCoolModeDecision(
+                event: "startRejected",
+                message: "风扇控制服务尚未完成授权"
+            )
             return
         }
 
@@ -346,6 +369,7 @@ final class FanControlModel: ObservableObject {
         coolModeAssessment = nil
         coolModeTargets = [:]
         coolModeState = .starting
+        recordCoolModeDecision(event: "startRequested")
         updateRefreshTimer()
         refresh(showLoading: false)
     }
@@ -354,6 +378,7 @@ final class FanControlModel: ObservableObject {
         guard coolModeState != .off || hasAppliedCoolModeTargets else { return }
         coolModeState = .stopping
         coolModeRequestInProgress = true
+        recordCoolModeDecision(event: "stopRequested")
         updateRefreshTimer()
 
         queue.async { [weak self] in
@@ -367,6 +392,10 @@ final class FanControlModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.coolModeState = .failed(self.friendlyMessage(for: error))
                     self.errorMessage = "清凉模式未能立即恢复自动散热：\(self.friendlyMessage(for: error))"
+                    self.recordCoolModeDecision(
+                        event: "stopFailed",
+                        message: self.friendlyMessage(for: error)
+                    )
                     self.coolModeRequestInProgress = false
                     self.updateRefreshTimer()
                 }
@@ -381,6 +410,7 @@ final class FanControlModel: ObservableObject {
         coolModeTargets = [:]
         coolModeAssessment = nil
         coolModeAlgorithm.reset()
+        recordCoolModeDecision(event: "stopped")
         updateRefreshTimer()
         if shouldAnnounce {
             showNotice("清凉模式已关闭，已恢复 macOS 自动散热")
@@ -423,6 +453,13 @@ final class FanControlModel: ObservableObject {
             return
         }
 
+        recordCoolModeDecision(
+            event: "decisionRequested",
+            input: input,
+            assessment: assessment,
+            targets: targets
+        )
+
         coolModeRequestInProgress = true
         queue.async { [weak self] in
             guard let self else { return }
@@ -437,10 +474,23 @@ final class FanControlModel: ObservableObject {
                     self.coolModeState = .active
                     self.coolModeAssessment = assessment
                     self.coolModeTargets = targets
+                    self.recordCoolModeDecision(
+                        event: "decisionApplied",
+                        input: input,
+                        assessment: assessment,
+                        targets: targets
+                    )
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.coolModeRequestInProgress = false
+                    self.recordCoolModeDecision(
+                        event: "decisionFailed",
+                        input: input,
+                        assessment: assessment,
+                        targets: targets,
+                        message: self.friendlyMessage(for: error)
+                    )
                     self.failCoolMode("清凉模式未能更新风扇：\(self.friendlyMessage(for: error))")
                 }
             }
@@ -452,6 +502,7 @@ final class FanControlModel: ObservableObject {
         coolModeState = .failed(message)
         coolModeRequestInProgress = false
         errorMessage = message
+        recordCoolModeDecision(event: "failed", message: message)
         updateRefreshTimer()
 
         if shouldStop {
@@ -490,7 +541,99 @@ final class FanControlModel: ObservableObject {
             .max()
     }
 
-    private func showNotice(_ message: String) {
+    func captureSnapshotForLogExport(completion: @escaping () -> Void) {
+        queue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async(execute: completion)
+                return
+            }
+
+            do {
+                let snapshot = try SMCController().snapshot()
+                let helperState = PrivilegedFanControl.authorizationState()
+                DispatchQueue.main.async {
+                    self.hardwareModel = snapshot.hardwareModel
+                    self.fans = snapshot.fans
+                    self.temperatures = snapshot.temperatures
+                    self.updateTemperatureHistories(with: snapshot.temperatures)
+                    self.helperAuthorizationState = helperState
+                    self.recordFanSnapshot()
+                    completion()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.recordFanSnapshot()
+                    completion()
+                }
+            }
+        }
+    }
+
+    private func recordFanSnapshot() {
+        monitoringLogs.recordFanSnapshot(
+            MonitoringFanLogSnapshot(
+                timestamp: Date(),
+                hardwareModel: hardwareModel,
+                helperAuthorizationState: monitoringLogAuthorizationState,
+                coolModeState: monitoringLogCoolModeState,
+                coolModePolicy: coolModePolicy.rawValue,
+                coolModeTargets: Dictionary(
+                    uniqueKeysWithValues: coolModeTargets.map { (String($0.key), $0.value) }
+                ),
+                fans: fans.map(\.monitoringLogRecord),
+                temperatures: temperatures.map(\.monitoringLogRecord)
+            )
+        )
+    }
+
+    private func recordCoolModeDecision(
+        event: String,
+        input: CoolModeInput? = nil,
+        assessment: CoolModeAssessment? = nil,
+        targets: [Int: Double]? = nil,
+        message: String? = nil
+    ) {
+        let selectedTargets = targets ?? coolModeTargets
+        monitoringLogs.recordCoolModeDecision(
+            MonitoringCoolModeDecision(
+                timestamp: Date(),
+                event: event,
+                state: monitoringLogCoolModeState,
+                policy: coolModePolicy.rawValue,
+                helperAuthorizationState: monitoringLogAuthorizationState,
+                input: input?.monitoringLogRecord,
+                assessment: assessment?.monitoringLogRecord,
+                targetRPMs: Dictionary(
+                    uniqueKeysWithValues: selectedTargets.map { (String($0.key), $0.value) }
+                ),
+                fans: fans.map(\.monitoringLogRecord),
+                message: message
+            )
+        )
+    }
+
+    private var monitoringLogAuthorizationState: String {
+        switch helperAuthorizationState {
+        case .checking: return "checking"
+        case .notRegistered: return "notRegistered"
+        case .needsUpdate: return "needsUpdate"
+        case .requiresApproval: return "requiresApproval"
+        case .enabled: return "enabled"
+        case .unavailable(let message): return "unavailable: \(message)"
+        }
+    }
+
+    private var monitoringLogCoolModeState: String {
+        switch coolModeState {
+        case .off: return "off"
+        case .starting: return "starting"
+        case .active: return "active"
+        case .stopping: return "stopping"
+        case .failed(let message): return "failed: \(message)"
+        }
+    }
+
+    func showNotice(_ message: String) {
         noticeDismissWorkItem?.cancel()
         withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
             noticeMessage = message
@@ -710,7 +853,7 @@ struct FanControlPage: View {
 
             }
         }
-        .background(Color.white)
+        .background(TaskManagerStyle.surface)
         .onAppear {
             model.start()
         }
@@ -923,10 +1066,7 @@ private struct CoolModeFanMask: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            Color(red: 0.60, green: 0.62, blue: 0.66)
-                .opacity(0.52)
-        )
+        .background(TaskManagerStyle.coolModeMask)
         .overlay {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .stroke(TaskManagerStyle.muted.opacity(0.34), lineWidth: 1)
@@ -1021,8 +1161,8 @@ private struct FanControlCard: View {
                     .frame(height: 24)
                     .background(
                         fan.isManual
-                            ? Color(red: 0.90, green: 0.95, blue: 1.0)
-                            : Color(red: 0.91, green: 0.98, blue: 0.94)
+                            ? TaskManagerStyle.manualBadge
+                            : TaskManagerStyle.automaticBadge
                     )
                     .clipShape(Capsule())
             }
@@ -1085,7 +1225,7 @@ private struct FanControlCard: View {
             }
         }
         .padding(18)
-        .background(Color.white)
+        .background(TaskManagerStyle.surface)
         .overlay {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .stroke(TaskManagerStyle.grid, lineWidth: 1)
@@ -1154,10 +1294,10 @@ private struct FanHelperSetupBanner: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
-        .background(Color(red: 0.94, green: 0.97, blue: 1.0))
+        .background(TaskManagerStyle.helperBanner)
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(red: 0.72, green: 0.84, blue: 0.94), lineWidth: 1)
+                .stroke(TaskManagerStyle.helperBannerBorder, lineWidth: 1)
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
@@ -1205,7 +1345,7 @@ private final class FanControlCardState: ObservableObject {
     }
 }
 
-private struct FanPrimaryButtonStyle: ButtonStyle {
+struct FanPrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .medium))
@@ -1228,10 +1368,10 @@ private struct FanSecondaryButtonStyle: ButtonStyle {
             .foregroundColor(TaskManagerStyle.text)
             .frame(maxWidth: .infinity)
             .frame(height: 34)
-            .background(configuration.isPressed ? Color.black.opacity(0.08) : Color.white)
+            .background(configuration.isPressed ? TaskManagerStyle.pressedOverlay : TaskManagerStyle.elevatedSurface)
             .overlay {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .stroke(Color(red: 0.75, green: 0.77, blue: 0.80), lineWidth: 1)
+                    .stroke(TaskManagerStyle.border, lineWidth: 1)
             }
             .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }

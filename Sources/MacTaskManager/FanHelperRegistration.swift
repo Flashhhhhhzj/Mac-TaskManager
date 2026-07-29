@@ -194,7 +194,7 @@ struct FirstLaunchAuthorizationView: View {
         VStack(spacing: 22) {
             ZStack {
                 Circle()
-                    .fill(Color(red: 0.91, green: 0.96, blue: 1.0))
+                    .fill(TaskManagerStyle.onboardingAccentSurface)
                     .frame(width: 62, height: 62)
                 Image(systemName: "lock.shield.fill")
                     .font(.system(size: 28))
@@ -226,7 +226,7 @@ struct FirstLaunchAuthorizationView: View {
                 )
             }
             .padding(14)
-            .background(Color(red: 0.965, green: 0.972, blue: 0.985))
+            .background(TaskManagerStyle.elevatedSurface)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             HStack(spacing: 12) {
@@ -250,7 +250,7 @@ struct FirstLaunchAuthorizationView: View {
         }
         .padding(28)
         .frame(width: 520)
-        .background(Color.white)
+        .background(TaskManagerStyle.surface)
         .onReceive(
             NotificationCenter.default.publisher(
                 for: NSApplication.didBecomeActiveNotification

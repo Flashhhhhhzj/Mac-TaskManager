@@ -31,6 +31,13 @@ public enum CoolModeHeatLevel: String, Equatable, Sendable {
     }
 }
 
+public enum CoolModeSmoothingAction: String, Equatable, Sendable {
+    case initial
+    case heldWithinHysteresis
+    case rampUp
+    case rampDown
+}
+
 public struct CoolModeInput: Equatable, Sendable {
     public let cpuUsage: Double
     public let gpuUsage: Double
@@ -73,7 +80,13 @@ public struct CoolModeInput: Equatable, Sendable {
 public struct CoolModeAssessment: Equatable, Sendable {
     public let heatLevel: CoolModeHeatLevel
     public let predictedHeatScore: Double
+    public let workloadScore: Double
+    public let temperatureScore: Double
+    public let risingBonus: Double
+    public let requestedCoolingDemand: Double
     public let coolingDemand: Double
+    public let previousCoolingDemand: Double?
+    public let smoothingAction: CoolModeSmoothingAction
     public let dominantFactor: String
     public let highestTemperature: Double
     public let temperatureRise: Double
@@ -81,14 +94,26 @@ public struct CoolModeAssessment: Equatable, Sendable {
     public init(
         heatLevel: CoolModeHeatLevel,
         predictedHeatScore: Double,
+        workloadScore: Double,
+        temperatureScore: Double,
+        risingBonus: Double,
+        requestedCoolingDemand: Double,
         coolingDemand: Double,
+        previousCoolingDemand: Double?,
+        smoothingAction: CoolModeSmoothingAction,
         dominantFactor: String,
         highestTemperature: Double,
         temperatureRise: Double
     ) {
         self.heatLevel = heatLevel
         self.predictedHeatScore = predictedHeatScore
+        self.workloadScore = workloadScore
+        self.temperatureScore = temperatureScore
+        self.risingBonus = risingBonus
+        self.requestedCoolingDemand = requestedCoolingDemand
         self.coolingDemand = coolingDemand
+        self.previousCoolingDemand = previousCoolingDemand
+        self.smoothingAction = smoothingAction
         self.dominantFactor = dominantFactor
         self.highestTemperature = highestTemperature
         self.temperatureRise = temperatureRise
@@ -142,14 +167,22 @@ public struct CoolModeAlgorithm: Sendable {
         let risingBonus = min(temperatureRise * 8, 24)
         let predictedHeat = scoreClamp(workload * 0.58 + temperatureScore * 0.42 + risingBonus)
         let requestedDemand = demand(for: predictedHeat, policy: policy)
-        let coolingDemand = smooth(requestedDemand, policy: policy)
+        let previousCoolingDemand = previousDemand
+        let smoothing = smooth(requestedDemand, policy: policy)
+        let coolingDemand = smoothing.demand
 
         previousTemperature = highestTemperature > 0 ? highestTemperature : previousTemperature
 
         return CoolModeAssessment(
             heatLevel: heatLevel(for: predictedHeat),
             predictedHeatScore: predictedHeat,
+            workloadScore: workload,
+            temperatureScore: temperatureScore,
+            risingBonus: risingBonus,
+            requestedCoolingDemand: requestedDemand,
             coolingDemand: coolingDemand,
+            previousCoolingDemand: previousCoolingDemand,
+            smoothingAction: smoothing.action,
             dominantFactor: dominantFactor(
                 cpu: cpu,
                 gpu: gpu,
@@ -162,15 +195,18 @@ public struct CoolModeAlgorithm: Sendable {
         )
     }
 
-    private mutating func smooth(_ requestedDemand: Double, policy: CoolModePolicy) -> Double {
+    private mutating func smooth(
+        _ requestedDemand: Double,
+        policy: CoolModePolicy
+    ) -> (demand: Double, action: CoolModeSmoothingAction) {
         guard let previousDemand else {
             self.previousDemand = requestedDemand
-            return requestedDemand
+            return (requestedDemand, .initial)
         }
 
         let difference = requestedDemand - previousDemand
         if abs(difference) < 4 {
-            return previousDemand
+            return (previousDemand, .heldWithinHysteresis)
         }
 
         let riseLimit: Double
@@ -194,7 +230,7 @@ public struct CoolModeAlgorithm: Sendable {
             smoothed = max(previousDemand - fallLimit, requestedDemand)
         }
         self.previousDemand = smoothed
-        return smoothed
+        return (smoothed, difference > 0 ? .rampUp : .rampDown)
     }
 
     private func demand(for predictedHeat: Double, policy: CoolModePolicy) -> Double {
