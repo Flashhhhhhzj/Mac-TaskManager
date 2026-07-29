@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/macos-task-manager-on-mac.png" alt="Mac-TaskManager 运行于 macOS" width="900" />
+  <img src="assets/mac-taskmanager-processes.png" alt="Mac-TaskManager 进程监控页" width="900" />
 </p>
 
 ---
