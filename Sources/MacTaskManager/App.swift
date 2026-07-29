@@ -530,7 +530,10 @@ class SystemMonitor: ObservableObject {
             }
         }
 
-        let appMap = Dictionary(uniqueKeysWithValues: runningApps.map { ($0.processIdentifier, $0) })
+        var appMap: [pid_t: NSRunningApplication] = [:]
+        for app in runningApps where app.processIdentifier > 0 {
+            appMap[app.processIdentifier] = app
+        }
         var currentProcessIDs = Set<Int32>()
 
         for line in lines {
@@ -1198,8 +1201,22 @@ enum AppTheme: String, CaseIterable {
         return theme
     }
 
+    /// Resolves the system option before applying a theme to any app window.
+    /// This avoids reading the current task-manager window appearance, which
+    /// may still be carrying the previously selected light/dark appearance.
+    private static var systemTheme: AppTheme {
+        let interfaceStyle = UserDefaults.standard.string(forKey: "AppleInterfaceStyle")
+        return interfaceStyle?.localizedCaseInsensitiveCompare("Dark") == .orderedSame
+            ? .dark
+            : .light
+    }
+
+    private var resolvedTheme: AppTheme {
+        self == .system ? Self.systemTheme : self
+    }
+
     var preferredColorScheme: ColorScheme? {
-        switch self {
+        switch resolvedTheme {
         case .system: return nil
         case .light: return .light
         case .dark: return .dark
@@ -1207,7 +1224,7 @@ enum AppTheme: String, CaseIterable {
     }
 
     private var appearance: NSAppearance? {
-        switch self {
+        switch resolvedTheme {
         case .system: return nil
         case .light: return NSAppearance(named: .aqua)
         case .dark: return NSAppearance(named: .darkAqua)
@@ -1215,14 +1232,27 @@ enum AppTheme: String, CaseIterable {
     }
 
     static func applyToApplication(_ theme: AppTheme) {
-        NSApp.appearance = theme.appearance
-        let effectiveAppearance = theme.appearance ?? NSApp.effectiveAppearance
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let background = isDark
-            ? NSColor(srgbRed: 0.086, green: 0.114, blue: 0.149, alpha: 1)
-            : NSColor.white
-        for window in NSApp.windows {
-            window.appearance = theme.appearance
+        // A process-wide appearance also gets inherited by the system-owned
+        // status-item button. Keep that button in the Finder/menu-bar
+        // appearance, while applying the selected appearance only to our
+        // windows below.
+        NSApp.appearance = nil
+        let resolvedTheme = theme.resolvedTheme
+        let background: NSColor
+        switch resolvedTheme {
+        case .system:
+            background = .windowBackgroundColor
+        case .light:
+            background = .white
+        case .dark:
+            background = NSColor(srgbRed: 0.086, green: 0.114, blue: 0.149, alpha: 1)
+        }
+        // Do not apply the selected app theme to AppKit's transient windows
+        // (the status-item host and NSPopover). Those live in the Finder menu
+        // bar and must retain the system appearance. Only the task-manager's
+        // document window has a standard title style.
+        for window in NSApp.windows where window.styleMask.contains(.titled) {
+            window.appearance = resolvedTheme.appearance
             window.backgroundColor = background
             window.contentView?.layer?.backgroundColor = background.cgColor
             window.contentView?.superview?.layer?.backgroundColor = background.cgColor
@@ -1253,6 +1283,16 @@ final class ContentViewState: ObservableObject {
     }
     @Published var defaultStartPage = "进程"
     @Published var updateSpeed = "常规"
+    @Published var launchAtLoginEnabled = AppRuntimePreferences.isLaunchAtLoginEnabled {
+        didSet {
+            AppRuntimePreferences.setLaunchAtLoginEnabled(launchAtLoginEnabled)
+        }
+    }
+    @Published var keepRunningAfterWindowClose = AppRuntimePreferences.keepsRunningAfterWindowClose {
+        didSet {
+            AppRuntimePreferences.setKeepsRunningAfterWindowClose(keepRunningAfterWindowClose)
+        }
+    }
     @Published var coolModePolicy = CoolModePreferences.currentPolicy.rawValue {
         didSet {
             UserDefaults.standard.set(selectedCoolModePolicy.rawValue, forKey: CoolModePreferences.policyKey)
@@ -2365,6 +2405,37 @@ final class RunningApplicationsPopoverState: ObservableObject {
     @Published var selectedPID: Int32?
 }
 
+/// Keeps this popover's scroller independent of the macOS global
+/// "always show scroll bars" preference. The native overlay style floats over
+/// the list and automatically fades away after scrolling stops.
+private struct OverlayAutoHidingScroller: NSViewRepresentable {
+    func makeNSView(context: Context) -> OverlayAutoHidingScrollerView {
+        OverlayAutoHidingScrollerView()
+    }
+
+    func updateNSView(_ nsView: OverlayAutoHidingScrollerView, context: Context) {}
+}
+
+private final class OverlayAutoHidingScrollerView: NSView {
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        configureEnclosingScrollView()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureEnclosingScrollView()
+    }
+
+    private func configureEnclosingScrollView() {
+        DispatchQueue.main.async { [weak self] in
+            guard let scrollView = self?.enclosingScrollView else { return }
+            scrollView.scrollerStyle = .overlay
+            scrollView.autohidesScrollers = true
+        }
+    }
+}
+
 struct PopoverKillButton: View {
     let processName: String
     let mode: ProcessTerminationMode
@@ -2393,13 +2464,26 @@ struct PopoverKillButton: View {
 struct RunningApplicationsPopover: View {
     @ObservedObject var monitor: SystemMonitor
     @StateObject private var popoverState = RunningApplicationsPopoverState()
+    @AppStorage(AppTheme.preferenceKey) private var appTheme = AppTheme.system.rawValue
 
     private let popoverWidth: CGFloat = 338
     private let popoverHeight: CGFloat = 480
-    private let nameWidth: CGFloat = 196
     private let actionWidth: CGFloat = 42
     private let memoryWidth: CGFloat = 100
     private let rowHeight: CGFloat = 42
+    private let scrollRailWidth: CGFloat = 8
+
+    private var tableWidth: CGFloat {
+        popoverWidth - scrollRailWidth
+    }
+
+    private var nameWidth: CGFloat {
+        tableWidth - actionWidth - memoryWidth
+    }
+
+    private var selectedAppTheme: AppTheme {
+        AppTheme(rawValue: appTheme) ?? .system
+    }
 
     private var appProcesses: [AppProcess] {
         monitor.processes
@@ -2426,12 +2510,15 @@ struct RunningApplicationsPopover: View {
                     }
                 }
                 .padding(.bottom, 10)
+                .background(OverlayAutoHidingScroller())
+                .frame(width: tableWidth, alignment: .leading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(TaskManagerStyle.surface)
         }
         .frame(width: popoverWidth, height: popoverHeight)
         .background(TaskManagerStyle.chrome)
+        .preferredColorScheme(selectedAppTheme.preferredColorScheme)
         .onAppear {
             monitor.updateData()
             if let selectedPID = popoverState.selectedPID, !appProcesses.contains(where: { $0.pid == selectedPID }) {
@@ -2446,6 +2533,8 @@ struct RunningApplicationsPopover: View {
             headerCell("", width: actionWidth, alignment: .center)
             headerCell("内存", width: memoryWidth, alignment: .center)
         }
+        .frame(width: tableWidth, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(TaskManagerStyle.headerCell)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -3521,8 +3610,8 @@ struct SettingsPage: View {
                         dropdownCoordinator: dropdownCoordinator
                     )
                 }
-                .zIndex(dropdownCoordinator.expandedIdentifier == "app-theme" ? 10 : 0)
                 .padding(.bottom, 30)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "app-theme" ? 10 : 0)
 
                 SettingsSectionTitle("常规")
                 SettingsOptionRow(
@@ -3537,8 +3626,8 @@ struct SettingsPage: View {
                         dropdownCoordinator: dropdownCoordinator
                     )
                 }
-                .zIndex(dropdownCoordinator.expandedIdentifier == "default-start-page" ? 10 : 0)
                 .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "default-start-page" ? 10 : 0)
 
                 SettingsOptionRow(
                     icon: "speedometer",
@@ -3552,8 +3641,44 @@ struct SettingsPage: View {
                         dropdownCoordinator: dropdownCoordinator
                     )
                 }
-                .zIndex(dropdownCoordinator.expandedIdentifier == "update-speed" ? 10 : 0)
                 .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "update-speed" ? 10 : 0)
+
+                SettingsOptionRow(
+                    icon: "power",
+                    title: "开机自启",
+                    subtitle: "登录 Mac 后自动启动 Mac-TaskManager"
+                ) {
+                    SettingsDropdown(
+                        selection: Binding(
+                            get: { state.launchAtLoginEnabled ? "开启" : "关闭" },
+                            set: { state.launchAtLoginEnabled = $0 == "开启" }
+                        ),
+                        options: ["开启", "关闭"],
+                        identifier: "launch-at-login",
+                        dropdownCoordinator: dropdownCoordinator
+                    )
+                }
+                .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "launch-at-login" ? 10 : 0)
+
+                SettingsOptionRow(
+                    icon: "rectangle.on.rectangle",
+                    title: "关闭窗口后仍保持后台运行",
+                    subtitle: "关闭最后一个窗口后保留状态栏图标并继续监控"
+                ) {
+                    SettingsDropdown(
+                        selection: Binding(
+                            get: { state.keepRunningAfterWindowClose ? "开启" : "关闭" },
+                            set: { state.keepRunningAfterWindowClose = $0 == "开启" }
+                        ),
+                        options: ["开启", "关闭"],
+                        identifier: "keep-running-after-window-close",
+                        dropdownCoordinator: dropdownCoordinator
+                    )
+                }
+                .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "keep-running-after-window-close" ? 10 : 0)
 
                 SettingsSectionTitle("数据与日志")
                 SettingsOptionRow(
@@ -3561,20 +3686,22 @@ struct SettingsPage: View {
                     title: "保存监控日志",
                     subtitle: monitoringLogs.persistenceDescription
                 ) {
-                    Toggle(
-                        "保存监控日志",
-                        isOn: Binding(
-                            get: { monitoringLogs.isPersistenceEnabled },
-                            set: { enabled in
+                    SettingsDropdown(
+                        selection: Binding(
+                            get: { monitoringLogs.isPersistenceEnabled ? "开启" : "关闭" },
+                            set: { value in
+                                let enabled = value == "开启"
                                 monitoringLogs.setPersistenceEnabled(enabled)
                                 fanControl.setMonitoringLogPersistenceEnabled(enabled)
                             }
-                        )
+                        ),
+                        options: ["开启", "关闭"],
+                        identifier: "monitoring-log-persistence",
+                        dropdownCoordinator: dropdownCoordinator
                     )
-                    .labelsHidden()
-                    .toggleStyle(.switch)
                 }
                 .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "monitoring-log-persistence" ? 10 : 0)
 
                 SettingsOptionRow(
                     icon: "square.and.arrow.down",
@@ -3605,8 +3732,8 @@ struct SettingsPage: View {
                         dropdownCoordinator: dropdownCoordinator
                     )
                 }
-                .zIndex(dropdownCoordinator.expandedIdentifier == "termination-mode" ? 10 : 0)
                 .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "termination-mode" ? 10 : 0)
 
                 SettingsSectionTitle("散热")
                 SettingsOptionRow(
@@ -3629,8 +3756,8 @@ struct SettingsPage: View {
                         dropdownCoordinator: dropdownCoordinator
                     )
                 }
-                .zIndex(dropdownCoordinator.expandedIdentifier == "cool-mode-policy" ? 10 : 0)
                 .padding(.bottom, 12)
+                .zIndex(dropdownCoordinator.expandedIdentifier == "cool-mode-policy" ? 10 : 0)
 
                 SettingsExpandableCard(
                     icon: "macwindow",
@@ -3649,6 +3776,18 @@ struct SettingsPage: View {
                     .padding(.top, 16)
                     .padding(.bottom, 20)
                 }
+
+                VStack(spacing: 6) {
+                    Text(applicationVersionText)
+                        .font(.system(size: 11))
+                        .foregroundColor(TaskManagerStyle.muted)
+                    Link("GitHub 项目主页", destination: projectHomepage)
+                        .font(.system(size: 11))
+                        .foregroundColor(TaskManagerStyle.accent)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 30)
+                .padding(.bottom, 8)
             }
             .padding(.horizontal, 36)
             .padding(.bottom, 28)
@@ -3673,6 +3812,16 @@ struct SettingsPage: View {
                 }
             }
         }
+    }
+
+    private var applicationVersionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发构建"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        return build.map { "版本 \(version) (\($0))" } ?? "版本 \(version)"
+    }
+
+    private var projectHomepage: URL {
+        URL(string: "https://github.com/Flashhhhhhzj/Mac-TaskManager")!
     }
 }
 
@@ -3919,13 +4068,13 @@ private extension View {
     func settingsCardStyle() -> some View {
         self
             .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(TaskManagerStyle.settingsCard)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(TaskManagerStyle.settingsCard)
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .stroke(TaskManagerStyle.border, lineWidth: 1)
+                }
             )
-            .overlay {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .stroke(TaskManagerStyle.border, lineWidth: 1)
-            }
     }
 }
 
@@ -4491,6 +4640,10 @@ final class MenuBarStatusController: NSObject {
     private func configureStatusButton() {
         guard let button = statusItem.button else { return }
 
+        // Do not let the app's selected window theme pin this item to a
+        // light/dark appearance. NSStatusBar owns the surrounding menu bar.
+        button.appearance = nil
+
         let configuration = NSImage.SymbolConfiguration(
             pointSize: 14,
             weight: .medium,
@@ -4524,6 +4677,24 @@ final class MenuBarStatusController: NSObject {
     private func showPopover() {
         guard let button = statusItem.button, !popover.isShown else { return }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        configurePopoverWindowForFullScreenSpaces()
+    }
+
+    private func configurePopoverWindowForFullScreenSpaces() {
+        // NSPopover creates its window lazily when it is shown. Make that
+        // window auxiliary in full-screen Spaces so the status-item popover
+        // remains available while another app owns the primary full-screen
+        // window. Its normal transient behavior still dismisses it on an
+        // outside click.
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.popover.contentViewController?.view.window else { return }
+            window.collectionBehavior = [
+                .canJoinAllSpaces,
+                .fullScreenAuxiliary,
+                .transient,
+                .ignoresCycle
+            ]
+        }
     }
 }
 
@@ -4544,6 +4715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        AppRuntimePreferences.applyLaunchAtLoginPreference()
         if let applicationIcon = AppArtwork.applicationIcon {
             NSApp.applicationIconImage = applicationIcon
         }
@@ -4562,7 +4734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        !AppRuntimePreferences.keepsRunningAfterWindowClose
     }
 
     func applicationWillTerminate(_ notification: Notification) {
