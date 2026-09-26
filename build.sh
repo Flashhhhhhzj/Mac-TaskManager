@@ -9,8 +9,8 @@ APP_NAME="Mac-TaskManager"
 TARGET_NAME="MacTaskManager"
 FAN_HELPER_NAME="MacFanHelper"
 FAN_HELPER_SERVICE="local.Mac-TaskManager.FanHelper"
-APP_VERSION="${APP_VERSION:-1.0}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-2}"
+APP_VERSION="${APP_VERSION:-1.0.0}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-4}"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 
@@ -57,8 +57,11 @@ mkdir -p \
     "$APP_DIR/Contents/Resources" \
     "$APP_DIR/Contents/Library/LaunchDaemons"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
-cp "$FAN_HELPER_PATH" "$APP_DIR/Contents/MacOS/$FAN_HELPER_NAME"
-chmod 755 "$APP_DIR/Contents/MacOS/$FAN_HELPER_NAME"
+# SMAppService LaunchDaemons resolve BundleProgram relative to the app bundle.
+# Keep the helper in Resources, matching Apple's documented bundle layout and
+# avoiding stale registrations that point at an earlier helper location.
+cp "$FAN_HELPER_PATH" "$APP_DIR/Contents/Resources/$FAN_HELPER_NAME"
+chmod 755 "$APP_DIR/Contents/Resources/$FAN_HELPER_NAME"
 cp assets/app-icon.svg "$APP_DIR/Contents/Resources/app-icon.svg"
 cp assets/app-icon.png "$APP_DIR/Contents/Resources/app-icon.png"
 cp THIRD_PARTY_NOTICES.md "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES.md"
@@ -101,7 +104,7 @@ cat > "$APP_DIR/Contents/Library/LaunchDaemons/$FAN_HELPER_SERVICE.plist" <<EOF
     <key>Label</key>
     <string>$FAN_HELPER_SERVICE</string>
     <key>BundleProgram</key>
-    <string>Contents/MacOS/$FAN_HELPER_NAME</string>
+    <string>Contents/Resources/$FAN_HELPER_NAME</string>
     <key>MachServices</key>
     <dict>
         <key>$FAN_HELPER_SERVICE</key>
@@ -123,7 +126,7 @@ codesign \
     --options runtime \
     --timestamp \
     --sign "$CODESIGN_IDENTITY" \
-    "$APP_DIR/Contents/MacOS/$FAN_HELPER_NAME"
+    "$APP_DIR/Contents/Resources/$FAN_HELPER_NAME"
 codesign \
     --force \
     --options runtime \
