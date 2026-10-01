@@ -1804,6 +1804,7 @@ private enum TaskManagerFocus {
 
 private extension Notification.Name {
     static let taskManagerClearSearchFocus = Notification.Name("TaskManagerClearSearchFocus")
+    static let taskManagerClosePopover = Notification.Name("TaskManagerClosePopover")
 }
 
 struct TaskManagerTitleBar: View {
@@ -1862,7 +1863,13 @@ struct TaskManagerTitleBar: View {
                         NSApp.keyWindow?.zoom(nil)
                     }
                     WindowControlButton(icon: "xmark", isClose: true) {
-                        NSApp.terminate(nil)
+                        if let appDelegate = AppDelegate.shared {
+                            appDelegate.closeOrHideMainWindow()
+                        } else if AppRuntimePreferences.keepsRunningAfterWindowClose {
+                            (NSApp.keyWindow ?? NSApp.windows.first(where: { !($0 is NSPanel) }))?.orderOut(nil)
+                        } else {
+                            NSApp.terminate(nil)
+                        }
                     }
                 }
                 .frame(height: 64, alignment: .top)
@@ -2515,6 +2522,40 @@ struct RunningApplicationsPopover: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(TaskManagerStyle.surface)
+
+            Rectangle()
+                .fill(TaskManagerStyle.grid)
+                .frame(height: 1)
+
+            HStack {
+                Button(action: {
+                    NotificationCenter.default.post(name: .taskManagerClosePopover, object: nil)
+                    AppDelegate.shared?.showMainWindow()
+                }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "macwindow")
+                            .font(.system(size: 12))
+                        Text("打开任务管理器")
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .foregroundColor(TaskManagerStyle.text)
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Button(action: {
+                    NSApp.terminate(nil)
+                }) {
+                    Text("退出")
+                        .font(.system(size: 13))
+                        .foregroundColor(TaskManagerStyle.muted)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 38)
+            .background(TaskManagerStyle.chrome)
         }
         .frame(width: popoverWidth, height: popoverHeight)
         .background(TaskManagerStyle.chrome)
@@ -4615,11 +4656,24 @@ final class MenuBarStatusController: NSObject {
         statusItem.isVisible = true
         configureStatusButton()
         configurePopover()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleClosePopoverNotification),
+            name: .taskManagerClosePopover,
+            object: nil
+        )
     }
 
     func invalidate() {
+        NotificationCenter.default.removeObserver(self, name: .taskManagerClosePopover, object: nil)
         popover.close()
         NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    @objc private func handleClosePopoverNotification() {
+        if popover.isShown {
+            popover.performClose(nil)
+        }
     }
 
     /// The menu-bar agent restores its layout asynchronously during launch.
@@ -4698,11 +4752,14 @@ final class MenuBarStatusController: NSObject {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    static weak var shared: AppDelegate?
+
     let monitoringLogs: MonitoringLogRecorder
     let monitor: SystemMonitor
     let fanControl: FanControlModel
     private var menuBarStatusController: MenuBarStatusController?
+    weak var mainWindow: NSWindow?
 
     override init() {
         let monitoringLogs = MonitoringLogRecorder()
@@ -4711,6 +4768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.monitor = monitor
         self.fanControl = FanControlModel(monitor: monitor, monitoringLogs: monitoringLogs)
         super.init()
+        Self.shared = self
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -4737,6 +4795,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         !AppRuntimePreferences.keepsRunningAfterWindowClose
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow()
+        return true
+    }
+
+    func showMainWindow() {
+        let targetWindow = mainWindow ?? NSApp.windows.first(where: { !($0 is NSPanel) })
+        if let window = targetWindow {
+            if mainWindow == nil {
+                mainWindow = window
+                window.delegate = self
+            }
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    func closeOrHideMainWindow() {
+        if AppRuntimePreferences.keepsRunningAfterWindowClose {
+            let window = mainWindow ?? NSApp.keyWindow ?? NSApp.windows.first(where: { !($0 is NSPanel) })
+            window?.orderOut(nil)
+        } else {
+            NSApp.terminate(nil)
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if AppRuntimePreferences.keepsRunningAfterWindowClose {
+            sender.orderOut(nil)
+            return false
+        }
+        return true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         menuBarStatusController?.invalidate()
         fanControl.shutdown()
@@ -4745,6 +4837,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureWindows() {
         for window in NSApp.windows {
+            guard !(window is NSPanel) else { continue }
+            self.mainWindow = window
+            window.delegate = self
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
