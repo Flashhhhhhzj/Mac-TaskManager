@@ -10,11 +10,14 @@ enum FanHelperRegistration {
 
     enum RegistrationError: LocalizedError {
         case unregisterTimedOut
+        case registrationDenied(String)
 
         var errorDescription: String? {
             switch self {
             case .unregisterTimedOut:
                 return "等待旧版风扇控制服务退出超时，请重新启动 Mac-TaskManager 后再试。"
+            case .registrationDenied(let reason):
+                return "macOS 拒绝配置风扇控制服务。请确认应用位于“应用程序”文件夹，并在“系统设置 → 通用 → 登录项与扩展”中允许 Mac-TaskManager 后重试。\n\n\(reason)"
             }
         }
     }
@@ -41,18 +44,29 @@ enum FanHelperRegistration {
 
     static func registerOrRefresh() throws {
         let currentStatus = service.status
-        let needsRefresh =
-            !isCurrentBuildRegistered
-            && currentStatus != .notRegistered
-            && currentStatus != .notFound
-
-        if needsRefresh {
+        switch currentStatus {
+        case .enabled, .requiresApproval:
+            if isCurrentBuildRegistered {
+                return
+            }
             try unregisterAndWait()
-        } else if currentStatus == .enabled || currentStatus == .requiresApproval {
-            return
+        case .notRegistered, .notFound:
+            // The app may have been replaced or moved while UserDefaults kept
+            // an old build marker. Try to remove an orphaned registration from
+            // an earlier helper path before creating the current one.
+            if isCurrentBuildRegistered {
+                try? unregisterAndWait()
+                UserDefaults.standard.removeObject(forKey: registeredBuildKey)
+            }
+        @unknown default:
+            break
         }
 
-        try service.register()
+        do {
+            try service.register()
+        } catch {
+            throw RegistrationError.registrationDenied(error.localizedDescription)
+        }
         UserDefaults.standard.set(currentBuild, forKey: registeredBuildKey)
         UserDefaults.standard.removeObject(forKey: onboardingDismissedBuildKey)
     }

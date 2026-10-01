@@ -300,6 +300,7 @@ final class FanControlModel: ObservableObject {
                     self.isRegisteringHelper = false
                     if state == .requiresApproval {
                         self.showNotice("请在“登录项与扩展”中允许 Mac-TaskManager 后台运行。")
+                        PrivilegedFanControl.openSystemSettings()
                     } else if state == .enabled {
                         self.showNotice("一次性授权已完成，后续调整不再重复输入密码。")
                     }
